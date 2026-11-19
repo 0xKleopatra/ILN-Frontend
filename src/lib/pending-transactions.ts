@@ -19,6 +19,12 @@
  *   an operation lock. Unreachable RPCs preserve all entries unchanged.
  */
 
+import {
+  auditPendingTransactionsStorage,
+  PENDING_TRANSACTION_TTL_MS,
+  sanitizePendingTransactionRecord,
+} from '../utils/walletStorage';
+
 export type PendingTransactionStatus = 'submitted' | 'confirming';
 
 export interface PendingTransaction {
@@ -109,21 +115,11 @@ export function deriveOperationKey(
 function readEntries(storage?: StorageLike): PendingTransaction[] {
   const store = safeStorage(storage);
   if (!store) return [];
-  try {
-    const raw = store.getItem(PENDING_TRANSACTIONS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (entry): entry is PendingTransaction =>
-        !!entry &&
-        typeof entry === 'object' &&
-        typeof (entry as PendingTransaction).hash === 'string' &&
-        (entry as PendingTransaction).hash.length > 0
-    );
-  } catch {
-    return [];
-  }
+  const audited = auditPendingTransactionsStorage(store, {
+    ttlMs: PENDING_TRANSACTION_TTL_MS,
+    persistCleanup: true,
+  });
+  return audited.valid;
 }
 
 function writeEntries(entries: PendingTransaction[], storage?: StorageLike): void {
@@ -207,13 +203,20 @@ export function recordPendingTransaction(
     return entries;
   }
 
-  const next: PendingTransaction = {
-    ...entry,
+  const candidate: PendingTransaction = {
+    hash: entry.hash,
+    ...(entry.label !== undefined ? { label: entry.label } : {}),
     ...(opKey ? { operationKey: opKey } : {}),
+    ...(entry.address !== undefined ? { address: entry.address } : {}),
     createdAt: entry.createdAt ?? Date.now(),
+    ...(entry.lastCheckedAt !== undefined ? { lastCheckedAt: entry.lastCheckedAt } : {}),
     status: entry.status ?? 'submitted',
   };
-  const updated = [next, ...entries].slice(0, MAX_PENDING_TRANSACTIONS);
+  const sanitized = sanitizePendingTransactionRecord(candidate);
+  if (sanitized.status !== 'valid') {
+    return entries;
+  }
+  const updated = [sanitized.record, ...entries].slice(0, MAX_PENDING_TRANSACTIONS);
   writeEntries(updated, storage);
   return updated;
 }

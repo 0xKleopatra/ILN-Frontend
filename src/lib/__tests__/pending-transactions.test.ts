@@ -142,7 +142,7 @@ describe('reload/reconnect retry idempotency (#1287)', () => {
         {
           hash: 'legacy-hash-99',
           label: 'settle_invoice:99',
-          createdAt: 1700000000000,
+          createdAt: Date.now() - 60_000,
           status: 'submitted',
         },
       ])

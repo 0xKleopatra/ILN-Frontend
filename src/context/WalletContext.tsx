@@ -10,7 +10,7 @@ import {
   getNetwork,
   requestAccess,
 } from '@stellar/freighter-api';
-import { NETWORK_NAME, NETWORK_PASSPHRASE } from '@/constants';
+import { NETWORK_NAME, NETWORK_PASSPHRASE, SEP10_HOME_DOMAIN } from '@/constants';
 import {
   normalizeWalletNetwork,
   getMismatchDetails,
@@ -29,6 +29,7 @@ import {
   WALLET_SESSION_STORAGE_KEY,
   type WalletProviderType,
 } from '@/utils/walletStorage';
+import { purgeExpiredWalletRecords } from '@/utils/walletRecordStore';
 import {
   getWalletSessionTabId,
   hasWalletSessionConflict,
@@ -48,6 +49,13 @@ import { getSorobanTransactionStatus } from '@/utils/soroban';
 import { notifyTxSuccess } from '@/utils/txEvents';
 import WalletSelectionModal from '@/components/WalletSelectionModal';
 import { useToast } from './ToastContext';
+import {
+  authenticatedFetch,
+  authenticateWithSep10,
+  Sep10Error,
+  type Sep10Diagnostics,
+  type Sep10Session,
+} from '@/utils/sep10';
 
 type WalletProviderName = WalletProviderType;
 
@@ -69,13 +77,14 @@ export interface WalletProviderProps {
   idleWarningMs?: number;
 }
 
-interface WalletContextType {
+export interface WalletContextType {
   address: string | null;
   isConnected: boolean;
   isInstalled: boolean;
   isReconnecting: boolean;
   preferredWalletProvider: WalletProviderName | null;
   error: string | null;
+  errorCode: AuthErrorCode | null;
   networkMismatch: boolean;
   rpcMismatch: boolean;
   mismatchDetails: MismatchDetails | null;
@@ -90,12 +99,11 @@ interface WalletContextType {
   disconnect: () => void;
   signTx: (txXdr: string) => Promise<string>;
   switchNetwork: () => Promise<void>;
-  resetIdleTimer: () => void;
+  authenticate: () => Promise<void>;
+  authenticatedRequest: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }
 
 export const WalletContext = createContext<WalletContextType | undefined>(undefined);
-
-const STORAGE_KEY = WALLET_ADDRESS_STORAGE_KEY;
 
 function extractConnectionState(result: unknown): boolean {
   if (typeof result === 'boolean') {
@@ -145,6 +153,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   const [isInstalled, setIsInstalled] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<AuthErrorCode | null>(null);
   const [networkMismatch, setNetworkMismatch] = useState(false);
   const [rpcMismatch, setRpcMismatch] = useState(false);
   const [mismatchDetails, setMismatchDetails] = useState<MismatchDetails | null>(null);
@@ -157,6 +166,73 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   const [isSelectingProvider, setIsSelectingProvider] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState<WalletProviderName | null>(null);
   const [openWalletConnectByDefault, setOpenWalletConnectByDefault] = useState(false);
+  const checkingWalletRef = useRef(false);
+
+  const setAuthSession = useCallback((session: Sep10Session | null) => {
+    authSessionRef.current = session;
+    setAuthSessionState(session);
+  }, []);
+
+  const updateAddress = useCallback(
+    (nextAddress: string | null) => {
+      if (activeAddress.current !== nextAddress) {
+        authSessionVersion.current += 1;
+        activeAddress.current = nextAddress;
+        setAuthSession(null);
+        setAuthStatus('idle');
+        setAuthError(null);
+        setAuthDiagnostics({
+          domain: null,
+          network: NETWORK_NAME,
+          expiresAt: null,
+          serverHealth: 'unknown',
+        });
+      }
+      setAddress(nextAddress);
+    },
+    [setAuthSession]
+  );
+
+  const invalidateAuthForNetworkChange = useCallback(
+    (message: string) => {
+      if (!authSessionRef.current) return;
+      setAuthSession(null);
+      setAuthStatus('error');
+      setAuthError(new Sep10Error('NETWORK_MISMATCH', message));
+    },
+    [setAuthSession]
+  );
+
+  useEffect(() => {
+    if (!authSession) return;
+
+    let timer: ReturnType<typeof setTimeout>;
+    const expireSession = () => {
+      const currentSession = authSessionRef.current;
+      if (currentSession !== authSession) return;
+
+      const remaining = authSession.expiresAt - Date.now();
+      if (remaining > 0) {
+        timer = setTimeout(expireSession, Math.min(remaining, 2_147_483_647));
+        return;
+      }
+
+      setAuthSession(null);
+      setAuthStatus('expired');
+      setAuthError(
+        new Sep10Error(
+          'AUTH_REQUIRED',
+          'The SEP-10 session expired. Authenticate again to continue.'
+        )
+      );
+    };
+
+    timer = setTimeout(
+      expireSession,
+      Math.min(Math.max(authSession.expiresAt - Date.now(), 0), 2_147_483_647)
+    );
+    return () => clearTimeout(timer);
+  }, [authSession, setAuthSession]);
 
   const warningToastIdRef = React.useRef<string | null>(null);
   const disconnectRef = React.useRef<() => void>(() => {});
@@ -214,6 +290,19 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       setMismatchDetails(details);
       setNetworkMismatch(details.walletMismatch);
       setRpcMismatch(details.rpcMismatch);
+      if (details.walletMismatch) {
+        setRoles([]);
+        setRolesLoading(false);
+      }
+
+      const sessionNetwork = authSessionRef.current
+        ? normalizeWalletNetwork(authSessionRef.current.network)
+        : null;
+      if (sessionNetwork && sessionNetwork !== details.walletNetwork) {
+        invalidateAuthForNetworkChange(
+          'The wallet network changed. Authenticate again on the configured network.'
+        );
+      }
 
       return !details.walletMismatch;
     } catch (e) {
@@ -225,7 +314,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       setMismatchDetails(null);
       return false;
     }
-  }, []);
+  }, [invalidateAuthForNetworkChange]);
 
   /**
    * Refresh locally-remembered submissions from RPC network truth (#1143).
@@ -257,7 +346,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       if (installed) {
         const { address } = await getAddress();
         if (address) {
-          setAddress(address);
+          updateAddress(address);
           localStorage.setItem(STORAGE_KEY, address);
           await checkNetwork();
           // Background refresh: must not block connection setup.
@@ -267,7 +356,58 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     } catch (e) {
       console.error('Check connection failed', e);
     }
-  }, [checkNetwork, reconcileStaleTransactions]);
+  }, [checkNetwork, updateAddress]);
+
+  const checkActiveWallet = useCallback(async () => {
+    if (!address || checkingWalletRef.current) return;
+    checkingWalletRef.current = true;
+
+    try {
+      const installed = extractConnectionState(await isConnected());
+      setIsInstalled(installed);
+
+      const walletAddress = installed ? (await getAddress()).address : null;
+      if (!walletAddress) {
+        setAddress(null);
+        setWalletNetwork(null);
+        setNetworkMismatch(false);
+        setRpcMismatch(false);
+        setMismatchDetails(null);
+        setRoles([]);
+        setRolesLoading(false);
+        setError('Wallet connection is no longer available. Please reconnect.');
+        setErrorCode('wallet_not_connected');
+        clearWalletStorage();
+        setSelectedProvider(null);
+        return;
+      }
+
+      if (walletAddress !== address) {
+        clearWalletStorage();
+        localStorage.setItem(STORAGE_KEY, walletAddress);
+        setStoredWalletProvider('freighter');
+        setAddress(walletAddress);
+        setSelectedProvider('freighter');
+        setError('Connected wallet account changed.');
+        setErrorCode('wallet_identity_changed');
+      }
+
+      await checkNetwork();
+    } catch (walletError) {
+      console.error('Failed to verify active wallet identity', walletError);
+      setAddress(null);
+      setWalletNetwork(null);
+      setNetworkMismatch(false);
+      setRpcMismatch(false);
+      setMismatchDetails(null);
+      setError('Unable to verify the connected wallet. Please reconnect.');
+      setErrorCode(getWalletErrorCode(walletError));
+      clearWalletStorage();
+      setSelectedProvider(null);
+    } finally {
+      checkingWalletRef.current = false;
+    }
+  }, [address, checkNetwork]);
 
   const attemptSilentReconnect = useCallback(async () => {
     const savedProvider = getStoredWalletProvider();
@@ -311,7 +451,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
         return;
       }
 
-      setAddress(address);
+      updateAddress(address);
       localStorage.setItem(STORAGE_KEY, address);
       await checkNetwork();
       // Background refresh: must not block reconnect timing.
@@ -325,15 +465,27 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     } finally {
       setIsReconnecting(false);
     }
-  }, [checkNetwork, reconcileStaleTransactions]);
+  }, [checkNetwork, updateAddress]);
 
   useEffect(() => {
-    attemptSilentReconnect();
+    const timeout = window.setTimeout(() => {
+      void attemptSilentReconnect();
+    }, 0);
+    return () => window.clearTimeout(timeout);
   }, [attemptSilentReconnect]);
 
   useEffect(() => {
-    checkConnection();
+    const timeout = window.setTimeout(() => {
+      void checkConnection();
+    }, 0);
+    return () => window.clearTimeout(timeout);
   }, [checkConnection]);
+
+  // Drop expired or tampered wallet-linked records for every wallet/network,
+  // not just the one being reconnected (#1088 retention policy).
+  useEffect(() => {
+    purgeExpiredWalletRecords();
+  }, []);
 
   useEffect(() => {
     const handleStorage = (event: StorageEvent) => {
@@ -388,8 +540,6 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     }
 
     if (!address || networkMismatch) {
-      setRoles([]);
-      setRolesLoading(false);
       return;
     }
 
@@ -402,10 +552,10 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
 
   useEffect(() => {
     const interval = setInterval(() => {
-      if (address) checkNetwork();
+      void checkActiveWallet();
     }, 5000);
     return () => clearInterval(interval);
-  }, [address, checkNetwork]);
+  }, [checkActiveWallet]);
 
   const disconnect = useCallback(() => {
     // Clear all in-memory wallet state...
@@ -416,6 +566,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     setSwitchingNetwork(false);
     setWalletNetwork(null);
     setError(null);
+    setErrorCode(null);
     setRoles([]);
     setRolesLoading(false);
     setIsSelectingProvider(false);
@@ -527,6 +678,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   // actual per-provider connect runs once the user chooses.
   const connect = async () => {
     setError(null);
+    setErrorCode(null);
     setOpenWalletConnectByDefault(selectedProvider === 'walletconnect');
     setIsSelectingProvider(true);
   };
@@ -542,6 +694,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       if (!installed) {
         const msg = 'Freighter not installed. Please install the extension.';
         setError(msg);
+        setErrorCode('wallet_unavailable');
         updateToast(toastId, { type: 'error', title: 'Connection Failed', message: msg });
         window.open('https://www.freighter.app/', '_blank');
         return;
@@ -554,6 +707,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
         if (freighterError) {
           journeyRecovery.markInterruption('auth', 'access_error');
           setError(freighterError);
+          setErrorCode(getWalletErrorCode(freighterError));
           updateToast(toastId, {
             type: 'error',
             title: 'Connection Failed',
@@ -563,7 +717,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
         }
 
         if (address) {
-          setAddress(address);
+          updateAddress(address);
           localStorage.setItem(STORAGE_KEY, address);
           setSelectedProvider('freighter');
           setStoredWalletProvider('freighter');
@@ -579,6 +733,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
           if (!isCorrectNetwork) {
             const networkMsg = `Please switch Freighter to ${NETWORK_NAME}`;
             setError(networkMsg);
+            setErrorCode('network_changed');
             updateToast(toastId, { type: 'error', title: 'Network Mismatch', message: networkMsg });
           } else {
             updateToast(toastId, {
@@ -593,13 +748,15 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
         journeyRecovery.markInterruption('auth', 'access_denied');
         const msg = 'Connection rejected by user.';
         setError(msg);
+        setErrorCode('wallet_rejected');
         updateToast(toastId, { type: 'error', title: 'Connection Failed', message: msg });
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error('Connection error:', e);
       journeyRecovery.markInterruption('auth', 'access_error');
-      const msg = e.message || 'Connection failed';
+      const msg = e instanceof Error ? e.message : 'Connection failed';
       setError(msg);
+      setErrorCode(getWalletErrorCode(e));
       updateToast(toastId, { type: 'error', title: 'Connection Failed', message: msg });
     }
   };
@@ -614,7 +771,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       const session = await connectWalletConnect({ address: customAddress });
       if (session?.address) {
         setAddress(session.address);
-        localStorage.setItem(STORAGE_KEY, session.address);
+        setStoredWalletAddress(session.address);
         setSelectedProvider('walletconnect');
         setStoredWalletProvider('walletconnect');
         publishSession({
@@ -676,6 +833,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       });
     } catch (e) {
       console.error('Failed to switch network', e);
+      setErrorCode('network_changed');
       addToast({
         type: 'error',
         title: 'Switch Failed',
@@ -743,40 +901,219 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     assertNoCrossTabChange();
     assertGenerationUnchanged();
 
-    if (selectedProvider === 'walletconnect') {
-      return await signTransactionWithWalletConnect(txXdr, {
+  const signTx = useCallback(
+    async (txXdr: string) => {
+      const isCorrectNetwork = await checkNetwork();
+      if (!isCorrectNetwork) {
+        const msg = `Network mismatch. Please switch to ${NETWORK_NAME}`;
+        addToast({ type: 'error', title: 'Transaction Failed', message: msg });
+        throw new Error(msg);
+      }
+      const signed = await signTransaction(txXdr, {
         networkPassphrase: NETWORK_PASSPHRASE,
       });
+
+      if (typeof signed === 'string') {
+        return signed;
+      }
+
+      if (signed.error) {
+        throw new Error(String(signed.error));
+      }
+
+      if (signed.signedTxXdr) {
+        return signed.signedTxXdr;
+      }
+
+      throw new Error('Freighter did not return a signed transaction.');
+    },
+    [checkNetwork, addToast]
+  );
+
+  const authenticate = useCallback(async () => {
+    if (!address) {
+      const error = new Sep10Error('AUTH_REQUIRED', 'Connect a wallet before authenticating.');
+      setAuthError(error);
+      setAuthStatus('error');
+      throw error;
     }
-
-    const signed = await signTransaction(txXdr, {
-      networkPassphrase: NETWORK_PASSPHRASE,
-    });
-
-    if (typeof signed === 'string') {
-      return signed;
-    }
-
-    // Wallet closed / dismissed without returning a payload: treat as an
-    // explicit cancellation without touching local UI state (#1144).
-    if (!signed || typeof signed !== 'object') {
-      throw new Error(
-        'USER_REJECTED: Wallet closed before signing completed. No changes were made.'
+    if (selectedProvider !== 'freighter') {
+      const error = new Sep10Error(
+        'CONFIGURATION',
+        'SEP-10 signing is currently available with Freighter only.'
       );
+      setAuthError(error);
+      setAuthStatus('error');
+      throw error;
     }
 
-    if (signed.error) {
-      throw new Error(String(signed.error));
-    }
+    const expectedAddress = address;
+    const sessionVersion = authSessionVersion.current;
+    const assertWalletIdentity = async () => {
+      if (
+        authSessionVersion.current !== sessionVersion ||
+        activeAddress.current !== expectedAddress
+      ) {
+        throw new Sep10Error(
+          'IDENTITY_CHANGED',
+          'The connected wallet changed during authentication. Retry with the active wallet.'
+        );
+      }
 
-    if (signed.signedTxXdr) {
-      return signed.signedTxXdr;
-    }
+      let currentAddress: string | null;
+      try {
+        const result = await getAddress();
+        currentAddress = result.address;
+        if (result.error) currentAddress = null;
+      } catch (cause) {
+        throw new Sep10Error(
+          'IDENTITY_CHANGED',
+          'The active wallet identity could not be verified.',
+          {
+            cause,
+          }
+        );
+      }
+      if (currentAddress !== expectedAddress) {
+        throw new Sep10Error(
+          'IDENTITY_CHANGED',
+          'The active wallet account changed. Reconnect the intended wallet and retry.'
+        );
+      }
 
-    throw new Error('Freighter did not return a signed transaction.');
-  };
+      let currentNetwork: string | null;
+      try {
+        currentNetwork = extractNetworkName(await getNetwork());
+      } catch (cause) {
+        throw new Sep10Error(
+          'NETWORK_MISMATCH',
+          'The active wallet network could not be verified.',
+          {
+            cause,
+          }
+        );
+      }
+      if (!currentNetwork || getMismatchDetails(currentNetwork).walletMismatch) {
+        throw new Sep10Error(
+          'NETWORK_MISMATCH',
+          `Switch the wallet to ${NETWORK_NAME} before authenticating.`
+        );
+      }
+    };
+
+    setAuthStatus('authenticating');
+    setAuthError(null);
+    setAuthSession(null);
+    try {
+      const session = await authenticateWithSep10({
+        address: expectedAddress,
+        homeDomain: SEP10_HOME_DOMAIN || window.location.hostname,
+        network: NETWORK_NAME,
+        networkPassphrase: NETWORK_PASSPHRASE,
+        signTransaction: signTx,
+        assertWalletIdentity,
+        onDiagnostics: setAuthDiagnostics,
+      });
+      await assertWalletIdentity();
+      setAuthSession(session);
+      setAuthStatus('authenticated');
+    } catch (cause) {
+      const error =
+        cause instanceof Sep10Error
+          ? cause
+          : new Sep10Error(
+              'SERVER_UNAVAILABLE',
+              'SEP-10 authentication failed. Retry to continue.',
+              {
+                cause,
+              }
+            );
+      if (authSessionVersion.current === sessionVersion) {
+        setAuthError(error);
+        setAuthStatus(error.code === 'AUTH_REQUIRED' ? 'expired' : 'error');
+      }
+      throw error;
+    }
+  }, [address, selectedProvider, signTx]);
+
+  const authenticatedRequest = useCallback(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        !address ||
+        selectedProvider !== 'freighter' ||
+        !authSession ||
+        authSession.address !== address ||
+        activeAddress.current !== address ||
+        authSession.expiresAt <= Date.now()
+      ) {
+        const error = new Sep10Error(
+          'AUTH_REQUIRED',
+          'Authenticate the connected wallet before accessing this resource.'
+        );
+        setAuthSession(null);
+        setAuthStatus('expired');
+        setAuthError(error);
+        throw error;
+      }
+
+      try {
+        let currentWallet: Awaited<ReturnType<typeof getAddress>>;
+        try {
+          currentWallet = await getAddress();
+        } catch (cause) {
+          throw new Sep10Error(
+            'IDENTITY_CHANGED',
+            'The active wallet identity could not be verified.',
+            { cause }
+          );
+        }
+        if (currentWallet.error || currentWallet.address !== authSession.address) {
+          throw new Sep10Error(
+            'IDENTITY_CHANGED',
+            'The active wallet changed. Authenticate again before making this request.'
+          );
+        }
+        let currentNetwork: string | null;
+        try {
+          currentNetwork = extractNetworkName(await getNetwork());
+        } catch (cause) {
+          throw new Sep10Error(
+            'NETWORK_MISMATCH',
+            'The active wallet network could not be verified.',
+            {
+              cause,
+            }
+          );
+        }
+        if (!currentNetwork || getMismatchDetails(currentNetwork).walletMismatch) {
+          throw new Sep10Error(
+            'NETWORK_MISMATCH',
+            `Switch the wallet to ${NETWORK_NAME} before making this request.`
+          );
+        }
+        return await authenticatedFetch(input, authSession, init);
+      } catch (cause) {
+        if (cause instanceof Sep10Error) {
+          if (
+            cause.code === 'HTTP_UNAUTHORIZED' ||
+            cause.code === 'IDENTITY_CHANGED' ||
+            cause.code === 'NETWORK_MISMATCH'
+          ) {
+            setAuthSession(null);
+            setAuthStatus(cause.code === 'NETWORK_MISMATCH' ? 'error' : 'expired');
+          }
+          setAuthError(cause);
+        }
+        throw cause;
+      }
+    },
+    [address, authSession, selectedProvider]
+  );
 
   const handleSelectWalletConnect = () => {
+    setAuthSession(null);
+    setAuthStatus('idle');
+    setAuthError(null);
     setSelectedProvider('walletconnect');
     setStoredWalletProvider('walletconnect');
     void connectWalletConnectProvider();
@@ -791,6 +1128,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
         isReconnecting,
         preferredWalletProvider: selectedProvider,
         error,
+        errorCode,
         networkMismatch,
         rpcMismatch,
         mismatchDetails,

@@ -6,6 +6,7 @@ import Navbar from '@/components/Navbar';
 import VoteProgressBar from '@/components/VoteProgressBar';
 import QuorumProgressBar from '@/components/QuorumProgressBar';
 import TokenAllowlistPanel from '@/components/governance/TokenAllowlistPanel';
+import GovernanceMockStatusBanner from '@/components/governance/GovernanceMockStatusBanner';
 import VotingPowerDisplay from '@/components/VotingPowerDisplay';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import PageHeader from '@/components/PageHeader';
@@ -85,7 +86,7 @@ function ProposalCard({ proposal }: { proposal: Proposal }) {
   return (
     <Link
       href={`/governance/${proposal.id}`}
-      className="group block rounded-2xl border border-outline-variant/20 bg-surface-container-lowest hover:border-primary/40 hover:shadow-lg transition-all duration-200 p-6"
+      className="proposal-card group block rounded-2xl border border-outline-variant/20 bg-surface-container-lowest hover:border-primary/40 hover:shadow-lg transition-all duration-200 p-6"
     >
       <div className="flex items-start justify-between gap-3 mb-3">
         <div className="flex items-center gap-2 flex-wrap">
@@ -201,14 +202,22 @@ export default function GovernancePage() {
 
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<ProposalFilter>('Active');
   const [page, setPage] = useState(1);
   const [votingPower, setVotingPower] = useState(0);
 
   const load = useCallback(async () => {
-    const data = await fetchProposals();
-    setProposals(data);
-    setLoading(false);
+    try {
+      const data = await fetchProposals();
+      setProposals(data);
+      setError(null);
+    } catch (err) {
+      setProposals([]);
+      setError(err instanceof Error ? err.message : 'Governance proposals unavailable');
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -288,6 +297,7 @@ export default function GovernancePage() {
           {/* Voting Power Display */}
           {isConnected && (
             <div className="mb-8">
+              <GovernanceMockStatusBanner action="getVotingPower" />
               <VotingPowerDisplay votingPower={votingPower} />
             </div>
           )}
@@ -305,14 +315,30 @@ export default function GovernancePage() {
           </div>
 
           <ErrorBoundary onRetry={() => void load()}>
-            {loading ? (
+            {error ? (
+              <div className="rounded-2xl border border-error/30 bg-error/10 p-8 text-center" role="alert">
+                <span className="material-symbols-outlined text-4xl text-error block mb-2">cloud_off</span>
+                <h3 className="text-lg font-bold text-error">Governance Data Unavailable</h3>
+                <p className="mt-1 text-sm text-on-surface-variant">
+                  {error.includes('GOVERNANCE_READ_UNAVAILABLE')
+                    ? 'Proposals could not be loaded from the governance contract. Please try again later.'
+                    : error}
+                </p>
+                <button
+                  onClick={() => void load()}
+                  className="mt-4 inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-semibold text-white hover:bg-primary/90"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : loading ? (
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
                 {Array.from({ length: 6 }).map((_, i) => (
                   <div key={i} className="h-64 rounded-2xl bg-surface-container animate-pulse" />
                 ))}
               </div>
             ) : filtered.length === 0 ? (
-              <div className="text-center py-24">
+              <div className="proposal-empty text-center py-24">
                 <span className="material-symbols-outlined text-5xl text-on-surface-variant/30 block mb-4">
                   inbox
                 </span>

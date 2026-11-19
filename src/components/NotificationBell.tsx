@@ -3,18 +3,18 @@
 import { useEffect, useState, useRef } from 'react';
 import { useWallet } from '@/context/WalletContext';
 import { useNotification, type NotificationItem } from '@/context/NotificationContext';
-import { MAX_NOTIFICATIONS } from '@/utils/notificationHelpers';
+import { MAX_NOTIFICATIONS, resolveNotificationCategory } from '@/utils/notificationHelpers';
 import NotificationDrawer from './NotificationDrawer';
 
 interface ExternalNotification {
   id: string;
-  category?: NotificationItem['category'];
+  category?: string;
   type: string;
   title: string;
   message: string;
   href?: string;
   createdAt: string;
-  read: boolean;
+  read?: boolean;
 }
 
 function mergeNotifications(
@@ -25,8 +25,7 @@ function mergeNotifications(
   const map = new Map(existing.map((notification) => [notification.id, notification]));
 
   incoming.forEach((notification) => {
-    const category =
-      notification.category ?? (notification.type === 'proposal' ? 'governance' : 'invoice');
+    const category = resolveNotificationCategory(notification.category, notification.type);
     const href = notification.href ?? '/dashboard';
     map.set(notification.id, {
       id: notification.id,
@@ -36,7 +35,7 @@ function mergeNotifications(
       message: notification.message,
       href,
       createdAt: notification.createdAt,
-      read: isRead(notification.id) || notification.read,
+      read: isRead(notification.id) || (notification.read ?? false),
     });
   });
 
@@ -96,9 +95,35 @@ export default function NotificationBell() {
     let active = true;
 
     const fetchNotifications = async () => {
-      // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- Legacy inline exception pending query hook migration
-      const res = await fetch(`/api/notifications/${address}`);
-      if (!active || !res.ok) return;
+      let res: Response | undefined;
+      try {
+        // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- Legacy inline exception pending query hook migration
+        res = await fetch(`/api/notifications/${address}`);
+      } catch {
+        // The notifications service is unreachable; keep cached state and
+        // signal the degradation honestly rather than surfacing an error.
+        if (active) setServiceUnavailable(true);
+        return;
+      }
+      if (!active) return;
+      if (!res || typeof res.status !== 'number') {
+        // No usable response (e.g. an interrupted poll). Never crash the poll
+        // loop; keep cached notifications and show the degraded marker.
+        setServiceUnavailable(true);
+        return;
+      }
+
+      if (res.status === 429 || res.status === 503) {
+        // Notifications service is degraded (rate limited or circuit open).
+        // Keep showing previously cached notifications; never clear them or
+        // present a broken/blank state. Signal the degradation honestly.
+        setServiceUnavailable(true);
+        return;
+      }
+
+      setServiceUnavailable(false);
+
+      if (!res.ok) return;
 
       const data = (await res.json()) as ExternalNotification[];
       // A poll that resolves after the wallet changed belongs to the previous
@@ -155,16 +180,16 @@ export default function NotificationBell() {
         {unreadCount > 0 && (
           <span
             aria-hidden
-            className={`absolute -right-0.5 -top-0.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-error px-1.5 text-[10px] font-bold text-on-error ${
+            className={`absolute top-0 right-0 flex h-4 w-4 items-center justify-center rounded-full bg-error text-[10px] font-bold text-on-error ${
               isPulsing ? 'animate-pulse' : ''
             }`}
           >
-            {unreadCount > 9 ? '9+' : unreadCount}
+            {unreadCount > 99 ? '99+' : unreadCount}
           </span>
         )}
       </button>
 
-      {/* Screen reader announcement for new notifications */}
+      {/* Screen reader live region for announcing new notifications */}
       <div role="status" aria-live="polite" className="sr-only" aria-label="Notification updates">
         {announcement}
       </div>

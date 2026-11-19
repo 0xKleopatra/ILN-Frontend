@@ -12,9 +12,17 @@ import {
   type TooltipProps,
 } from 'recharts';
 import { transformFundingData } from '@/utils/funding';
+import { fetchFunding } from '@/lib/indexer';
 import IndexerUnavailableNotice, {
   shouldUseDevMockFallback,
+  type IndexerNoticeStatus,
 } from '@/components/IndexerUnavailableNotice';
+import DataSourceCaption from '@/components/DataSourceCaption';
+import {
+  fetchFundingAnalytics,
+  classifyIndexerClientError,
+  isAbortError,
+} from '@/lib/indexer-client';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -132,25 +140,30 @@ export default function FundingChart() {
   const [data, setData] = useState<DailyFundingBucket[]>([]);
   const [loading, setLoading] = useState(true);
   const [unavailable, setUnavailable] = useState(false);
+  const [errorStatus, setErrorStatus] = useState<IndexerNoticeStatus>('unavailable');
   const [requestId, setRequestId] = useState(0);
 
-  const fetchData = useCallback(async (selectedRange: TimeRange) => {
+  const fetchData = useCallback(async (selectedRange: TimeRange, signal?: AbortSignal) => {
     setLoading(true);
     setUnavailable(false);
     try {
-      const baseUrl = process.env.NEXT_PUBLIC_INDEXER_API_URL ?? 'https://api.iln.example.com';
-      const res = await fetch(
-        `${baseUrl}/v1/analytics/funding?period=${selectedRange.toLowerCase()}`
-      );
-      if (!res.ok) throw new Error('Failed to fetch');
-      const json = await res.json();
-      setData(json.daily);
-    } catch {
+      const dailyData = await fetchFundingAnalytics(selectedRange.toLowerCase(), { signal });
+      setData(dailyData);
+    } catch (err) {
+      if (isAbortError(err)) {
+        return;
+      }
       // Only substitute demo data in development; otherwise show an honest
       // "temporarily unavailable" state instead of fabricating volume.
       if (shouldUseDevMockFallback()) {
         setData(generateMockFunding(selectedRange));
       } else {
+        const boundary = classifyIndexerClientError(err);
+        setErrorStatus(
+          boundary === 'rate-limited' || boundary === 'unauthorized' || boundary === 'malformed'
+            ? boundary
+            : 'unavailable'
+        );
         setData([]);
         setUnavailable(true);
       }
@@ -160,7 +173,11 @@ export default function FundingChart() {
   }, []);
 
   useEffect(() => {
-    void fetchData(range);
+    const controller = new AbortController();
+    void fetchData(range, controller.signal);
+    return () => {
+      controller.abort();
+    };
   }, [range, requestId, fetchData]);
 
   const transformedData = useMemo(() => transformFundingData(data), [data]);
@@ -173,6 +190,7 @@ export default function FundingChart() {
         <div>
           <h3 className="font-headline text-xl font-bold text-on-surface">LP Funding History</h3>
           <p className="text-sm text-on-surface-variant">Daily volume across supported tokens</p>
+          <DataSourceCaption metric="funding-history" />
         </div>
 
         {/* Time Range Selector */}
@@ -204,6 +222,7 @@ export default function FundingChart() {
           <div className="flex h-full items-center">
             <IndexerUnavailableNotice
               dataSource="Funding history"
+              status={errorStatus}
               onRetry={() => setRequestId((id) => id + 1)}
             />
           </div>

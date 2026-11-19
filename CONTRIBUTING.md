@@ -177,6 +177,8 @@ Read [docs/architecture.md](docs/architecture.md) first. Some questions have alr
 
 ### Data Fetching and React Query Architecture
 
+For full architectural specifications, key factories, caching defaults, and mutation patterns, consult the canonical **[Data-Fetching Architecture Guide](docs/data-fetching-architecture.md)** and **[Architecture Overview](docs/architecture.md)**.
+
 To ensure consistent caching, loading states, and bundle efficiency across the application:
 
 1. **Centralized Query Hooks**:
@@ -202,6 +204,31 @@ To ensure consistent caching, loading states, and bundle efficiency across the a
      // eslint-disable-next-line no-restricted-syntax, no-restricted-imports -- Legacy inline exception or client-only action
      ```
    - Provide a concise comment documenting why a custom hook in `src/hooks/queries` was not used.
+
+### Type Safety: `as any` Casts
+
+Bare `as any` casts silently defeat TypeScript and were the source of a 60+ instance backlog (see #908, #909, #910, #911). New unjustified casts are blocked by the custom `local/require-as-any-justification` ESLint rule in `eslint.config.mjs` (backed by `eslint-rules/require-as-any-justification.mjs`).
+
+1. **Prefer a real type first.** Before reaching for `as any`:
+   - Extend the domain interface (e.g. add an optional field such as `Invoice.whitelist` or `last_activity_ledger` instead of casting around its absence).
+   - Narrow `unknown` payloads (Soroban `scValToNative` results, Horizon event topics) with `typeof` / `in` checks and `Record<string, unknown>`.
+   - Model optional third-party surface explicitly (e.g. `FreighterWindow`, `TokenAvailability`) and use `as unknown as T` for stubs rather than `as any`.
+2. **If the cast is genuinely unavoidable** (a real third-party type gap such as an untyped `@stellar/freighter-api` experimental method or a `recharts` tooltip formatter signature), document it with a justification comment on the **immediately preceding line**:
+
+   ```typescript
+   // as-any justification: @stellar/freighter-api does not type the
+   // experimental `addTrustline` wallet method, so we cast the module
+   // namespace to reach it. Remove once upstream types include it.
+   // See https://github.com/stellar/freighter/issues/...
+   await (freighter as any).addTrustline?.({
+     assetCode: token.symbol,
+     assetIssuer: token.contractId,
+   });
+   ```
+
+   The comment must state the specific type-system limitation and, where one exists, link the upstream issue/type-definition gap. The lint rule errors when this comment is missing.
+
+3. **Scope:** the rule is `error` in production code and `warn` in tests/stories/`__tests__` (test doubles and DOM stubs legitimately need loose casts). Keep test casts minimal and typed where cheap to do so.
 
 ### Code Style and Formatting
 
@@ -391,6 +418,34 @@ This convention aligns with our commit message format and helps with changelog g
    - Add comments for complex logic
    - Update TypeScript types if needed
 
+### Closing issues that claim a mock was replaced
+
+A merged PR's `Closes #…` keyword automatically closes the issue whether or not the diff does what the issue says. Governance write paths were once closed as "live" while still returning `Math.random()` fake hashes and in-memory mock mutations because PR #670 was merged with `Closes #651 / #652 / #653` without manual or automated verification of the write paths. See the [governance mock-closure retrospective](docs/governance-mock-regression-retrospective.md) and [frontend mock closure audit](docs/frontend-mock-closure-audit.md) for full context on this motivating incident.
+
+To prevent recurrence, the following process controls are mandatory:
+
+- **PR Template Checklist Item (Process Control)**: Every PR template requires explicit confirmation of two items before merge:
+  1. _Mock-Replacement Verification_: If the PR claims to close an issue saying "replace mock", "implement real", or "wire live", both author and reviewer must confirm that the specific mock pattern (e.g. `Math.random()` fake hash, in-memory mock state mutation, unused signer parameter, `MOCK_*` array stub) is completely removed in the diff.
+  2. _Linked-Issue Behavior Verification_: Reviewers must verify that the actual behavior change described in the linked issue is present in the PR diff, not just that CI is green.
+- **Authors:** only use `Closes` for issues the diff fully resolves. Use `Refs #…` for partial work, and state explicitly in the description which sub-claims remain open.
+- **Reviewers:** check which checks actually ran on the PR. A PR with no test workflow in its checks list has no CI signal.
+- For contract-integration functions, record the function as `'real'` using the mock-backing detection helper ([docs/testing.md → Mock-backing detection](docs/testing.md#mock-backing-detection)).
+- If the PR changes a status doc (e.g. `docs/contract-integration-status.md` or `docs/mock-inventory.md`), the doc and the `Closes` lines must agree. If the doc still says **Stubbed** or **Mock**, the issue stays open.
+
+### Issue and PR Title Conventions (Implementation vs. Planning/Documentation)
+
+Issue titles like "Replace X mock with live integration" read as done-when-closed, which caused severe confusion when closed by planning or documentation PRs. All contributors and maintainers must adhere to the following title conventions (Issue #855):
+
+| Category            | Allowed Title Prefixes / Verbs                                                               | Usage Guidelines & Merge Requirements                                                                                                                                            | Examples                                                                                                                    |
+| :------------------ | :------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------- |
+| **Implementation**  | `feat:`, `fix:`, `Implement real <X>`, `Replace <X> mock with on-chain <Y>`, `Wire live <X>` | **Only** for PRs and issues delivering actual runtime code changes. May only be closed when the mock is completely removed from the production codebase and verified with tests. | `feat(governance): implement real castVote transaction signing`, `fix: replace lookupToken mock with live Soroban RPC read` |
+| **Planning & Spec** | `plan:`, `spec:`, `rfc:`, `Design <X>`, `Architecture for <X>`                               | For architectural designs, ADRs, sequence diagrams, and interface planning. **Never** use "Replace..." or "Wire..." in a planning issue title.                                   | `plan: design Soroban batch transaction signing architecture`, `spec: multi-token liquidity pool error handling`            |
+| **Documentation**   | `docs:`, `Document <X>`, `Update <X> guide`                                                  | For updating guides, API references, or status trackers.                                                                                                                         | `docs: document governance contract integration status`, `docs: update deployment runbook for testnet`                      |
+| **Audit & Triage**  | `audit:`, `triage:`, `Audit <X> for <Y>`                                                     | For surveys, static analysis, gap analysis, and incident retrospectives. The deliverable is a report doc or inventory, not the fix itself.                                       | `audit: review closed mock-replacement issues for regressions`, `audit: check as-any cast occurrences in components`        |
+| **Tracking / Epic** | `tracking:`, `epic:`, `[Epic] <X>`                                                           | Umbrella issues grouping multiple sub-tasks. Must **not** be closed via keyword by a PR resolving only a subset of child issues.                                                 | `tracking: governance live contract integration suite`, `epic: mainnet launch security controls`                            |
+
+These conventions apply to all new issues and PRs going forward and are referenced by this hardening batch (#853–#856).
+
 ### PR Description Template
 
 ```markdown
@@ -424,6 +479,8 @@ Add screenshots for UI changes
 - [ ] Documentation updated
 - [ ] No new warnings generated
 - [ ] All tests passing
+- [ ] Mock-replacement verification completed (if applicable)
+- [ ] Linked-issue behavior verified in diff
 ```
 
 ## Internationalization (i18n)
@@ -859,6 +916,7 @@ To maintain effective Wave throughput and ensure issues don't get claimed and ab
 The stale assignment bot runs daily and monitors assigned issues:
 
 1. **Warning Stage (7 days of inactivity)**
+
    - If an issue has been assigned for 7+ days with no linked PR activity, a warning comment is added
    - The issue is labeled with `stale-assignment-warning`
    - The assignee is notified with instructions to either:
@@ -874,6 +932,7 @@ The stale assignment bot runs daily and monitors assigned issues:
 ### Configuration
 
 The timeout periods are configurable in `.github/workflows/stale-assignments.yml`:
+
 - `WARNING_DAYS`: Days before warning comment (default: 7)
 - `RECLAIM_DAYS`: Days before unassignment (default: 14)
 

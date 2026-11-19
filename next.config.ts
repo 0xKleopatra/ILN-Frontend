@@ -1,34 +1,87 @@
 import type { NextConfig } from 'next';
 import withPWA from 'next-pwa';
 import { withSentryConfig } from '@sentry/nextjs';
+import { assertNoPublicIndexerSecrets } from './src/lib/indexer/env-guard';
+
+// Fail the build before Next.js can inline an indexer credential into browser bundles.
+assertNoPublicIndexerSecrets();
 
 const nextConfig: NextConfig & { allowedDevOrigins?: string[] } = {
   reactStrictMode: true,
   turbopack: {},
   allowedDevOrigins: ['127.0.0.1', 'localhost'],
+  // instrumentationHook moved out of experimental in Next 15+
+  // (removing stale flag that caused TS2353; instrumentation.ts is still picked up automatically)
+  experimental: {},
   async headers() {
     return [
       {
+        // Baseline CSP, clickjacking, MIME-sniffing, and referrer protections
+        // applied to every page (including wallet signing flows) and API route.
         source: '/:path*',
         headers: [
           {
             key: 'Content-Security-Policy',
-            value: `
-              default-src 'self';
-              script-src 'self' 'unsafe-inline' 'unsafe-eval' *.vercel.app;
-              style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
-              font-src 'self' https://fonts.gstatic.com;
-              img-src 'self' data: https:;
-              media-src 'self';
-              connect-src 'self' https://stellar.expert https://horizon.stellar.org https://horizon-testnet.stellar.org https://rpc-futurenet.stellar.org https://soroban-rpc.stellar.org https://soroban-rpc.stellar.org https://*.supabase.co https://api.github.com;
-              frame-ancestors 'none';
-              object-src 'none';
-              base-uri 'self';
-              form-action 'self';
-              upgrade-insecure-requests;
-            `
-              .replace(/\s+/g, ' ')
-              .trim(),
+            value: [
+              "default-src 'self'",
+              "script-src 'self' 'unsafe-inline' 'unsafe-eval' *.vercel.app",
+              "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+              "font-src 'self' https://fonts.gstatic.com",
+              "img-src 'self' data: https:",
+              "media-src 'self'",
+              [
+                "connect-src 'self'",
+                'https://stellar.expert',
+                'https://horizon.stellar.org',
+                'https://horizon-testnet.stellar.org',
+                'https://rpc-futurenet.stellar.org',
+                'https://soroban-testnet.stellar.org',
+                'https://soroban-rpc.stellar.org',
+                'https://*.supabase.co',
+                'https://api.github.com',
+              ].join(' '),
+              "frame-ancestors 'none'",
+              "object-src 'none'",
+              "base-uri 'self'",
+              "form-action 'self'",
+              'upgrade-insecure-requests',
+            ].join('; '),
+          },
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff',
+          },
+          {
+            key: 'X-Frame-Options',
+            value: 'DENY',
+          },
+          {
+            key: 'X-XSS-Protection',
+            value: '1; mode=block',
+          },
+          {
+            key: 'Referrer-Policy',
+            value: 'strict-origin-when-cross-origin',
+          },
+          {
+            key: 'Permissions-Policy',
+            value: 'geolocation=(), microphone=(), camera=(), browsing-topics=()',
+          },
+        ],
+      },
+      {
+        // Tightened response headers for API endpoints so JSON/API payloads
+        // cannot be framed, MIME-sniffed, leaked via Referer, or cached.
+        source: '/api/:path*',
+        headers: [
+          {
+            key: 'Content-Security-Policy',
+            value: [
+              "default-src 'none'",
+              "frame-ancestors 'none'",
+              "base-uri 'none'",
+              "form-action 'none'",
+            ].join('; '),
           },
           {
             key: 'X-Content-Type-Options',
@@ -40,11 +93,11 @@ const nextConfig: NextConfig & { allowedDevOrigins?: string[] } = {
           },
           {
             key: 'Referrer-Policy',
-            value: 'strict-origin-when-cross-origin',
+            value: 'no-referrer',
           },
           {
-            key: 'Permissions-Policy',
-            value: 'geolocation=(), microphone=(), camera=()',
+            key: 'Cache-Control',
+            value: 'no-store',
           },
         ],
       },

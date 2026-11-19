@@ -335,7 +335,7 @@ export default function NewGovernanceProposalPage() {
       const { proposalId } = await createProposal(payload, address, signTx, {
         walletNetwork: walletNetwork ?? undefined,
         context: toValidationContext(protocolParams),
-        onStage: setStage,
+        onStage: (stage) => setStage(stage as CreateProposalStage),
         onConfirmed: async () => {
           await invalidateGovernanceQueries({
             voterAddress: address,

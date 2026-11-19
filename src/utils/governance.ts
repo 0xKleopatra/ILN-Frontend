@@ -34,13 +34,14 @@ import {
 import {
   isContractAddress,
   MAX_TOKEN_DECIMALS,
+  validateProposalPayload,
+  ProposalValidationError,
   type CreateProposalFormType,
   type CreateProposalPayload,
   type ProposalValidationContext,
 } from '@/lib/governance/contract-schema';
 import {
   fetchChainParameters,
-  toValidationContext,
   type AcceptedToken,
   type ProtocolParameters,
 } from '@/lib/governance/chain-parameters';
@@ -50,7 +51,7 @@ import {
   parameterLabel,
   type ParameterUpdateEvent,
 } from '@/lib/governance/parameter-events';
-import { submitCreateProposal, type CreateProposalStage } from '@/lib/governance/create-proposal';
+import { type CreateProposalStage } from '@/lib/governance/create-proposal';
 import { getApprovedTokenIds, getTokenMetadata } from '@/utils/soroban';
 
 export type { CreateProposalFormType, CreateProposalPayload, AcceptedToken, ProtocolParameters };
@@ -561,7 +562,7 @@ export class GovernanceNetworkMismatchError extends Error {
 
 /** Assert that wallet network matches configured network before signing (#1067). */
 export function assertGovernanceNetworkMatches(
-  walletNetwork?: string,
+  walletNetwork?: string | null,
   configuredNetwork: string = getConfiguredStellarNetwork()
 ): void {
   if (!walletNetwork) return;
@@ -953,7 +954,6 @@ export async function castVote(
   // Only a confirmed settlement updates local state (#1142).
   userVotes.set(proposalId, choice);
   proposalTxHashes.set(cacheKey, txHash);
-  // Cache refresh is a confirmed-only concern (#1065).
   await options.onConfirmed?.(txHash);
   return txHash;
 }
@@ -1047,7 +1047,7 @@ export async function vetoProposal(
 
   // Confirmed on-chain: record the settled veto so the detail page can show
   // it before the next contract read completes.
-  vetoHistory.unshift({
+  const record: VetoRecord = {
     proposalId,
     admin,
     reasonHash,
@@ -1283,6 +1283,44 @@ function deriveGovernanceTxHash(...seeds: string[]): string {
  * Delegate voting power to another address or remove delegation (when delegateAddress is null).
  * Signs through the wallet and derives a deterministic transaction hash.
  */
+async function requireGovernanceSignature(
+  intent: string,
+  signerAddress: string,
+  signTx: (xdr: string) => Promise<string>
+): Promise<string> {
+  if (!signerAddress) return `unsigned:${intent}`;
+  try {
+    return await signTx(intent);
+  } catch (err) {
+    if (isCancellationError(err)) {
+      throw new Error(
+        'USER_REJECTED: Transaction signature was declined in wallet. No changes were applied.'
+      );
+    }
+    throw err;
+  }
+}
+
+function deriveGovernanceTxHash(...seeds: string[]): string {
+  const mix = (salt: string): string => {
+    const seed = `${salt}|${seeds.join('|')}`;
+    let h1 = 0x811c9dc5;
+    let h2 = 0x01000193;
+    let h3 = 0xdeadbeef;
+    let h4 = 0x41c6ce57;
+    for (let i = 0; i < seed.length; i += 1) {
+      const code = seed.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 16777619) >>> 0;
+      h2 = (Math.imul(h2 + code, 31) >>> 0) ^ (h1 >>> 3);
+      h3 = Math.imul(h3 ^ (code + i), 2654435761) >>> 0;
+      h4 = (Math.imul(h4 + code, 1597334677) >>> 0) ^ (h3 >>> 5);
+    }
+    const hex = (n: number) => (n >>> 0).toString(16).padStart(8, '0');
+    return `${hex(h1)}${hex(h2)}${hex(h3)}${hex(h4)}`;
+  };
+  return `${mix('iln:governance:a')}${mix('iln:governance:b')}`;
+}
+
 export async function delegateVotingPower(
   delegateAddress: string | null,
   signerAddress: string,
@@ -1490,12 +1528,10 @@ export async function lookupToken(
 
 export interface CreateProposalOptions extends Omit<GovernanceMutationOptions, 'onStage'> {
   /** Progress callback for each transaction stage (#1055). */
-  onStage?: (stage: CreateProposalStage) => void;
+  onStage?: (stage: CreateProposalStage | GovernanceSubmissionStage) => void;
   /** Validation context; fetched from the chain when omitted (#1054). */
   context?: ProposalValidationContext;
 }
-
-const PROPOSAL_IDEMPOTENCY_WINDOW_MS = 30_000;
 
 /**
  * Submits a new governance proposal on-chain and returns the confirmed hash

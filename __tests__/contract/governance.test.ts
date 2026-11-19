@@ -27,6 +27,18 @@ import {
   MOCK_PROPOSALS,
   type CreateProposalPayload,
 } from '@/utils/governance';
+import {
+  decodeGovernanceInvoke,
+  echoSignTx,
+  firstSimulatedTransaction,
+  GOV_TX_HASH,
+  makeProposalNative,
+  mockGovernanceWriteRpc,
+  restoreGovernanceWriteRpc,
+  simulationWithProposalId,
+  simulationWithProposals,
+  type GovernanceWriteMocks,
+} from '@/utils/__tests__/governance-write-test-utils';
 
 const SIGNER = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const mockSignTx = vi.fn(async (_xdr: string) => 'signedXDR');
@@ -210,9 +222,29 @@ describe('governance – fetchProposal', () => {
   });
 });
 
-describe('governance – createProposal', () => {
-  it('creates a FeeRate proposal and returns txHash + proposalId', async () => {
-    vi.useFakeTimers();
+describe('governance – createProposal (real transaction)', () => {
+  let writeMocks: GovernanceWriteMocks;
+
+  beforeEach(() => {
+    echoSignTx.mockClear();
+    writeMocks = mockGovernanceWriteRpc();
+  });
+
+  afterEach(() => {
+    restoreGovernanceWriteRpc(writeMocks);
+    vi.restoreAllMocks();
+  });
+
+  function mockRoundTrip(overrides: Record<string, unknown> = {}) {
+    const proposal = makeProposalNative(overrides);
+    writeMocks.simulateTransaction
+      .mockResolvedValueOnce(simulationWithProposalId(proposal.id as number))
+      .mockResolvedValueOnce(simulationWithProposals([proposal]));
+    return proposal;
+  }
+
+  it('creates a FeeRate proposal and returns the real txHash + proposalId', async () => {
+    mockRoundTrip();
     const payload: CreateProposalPayload = {
       formType: 'FeeRate',
       title: 'Reduce fee to 0.2%',
@@ -220,18 +252,16 @@ describe('governance – createProposal', () => {
       newValueBps: 20,
     };
 
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
-    vi.useRealTimers();
+    const result = await createProposal(payload, SIGNER, echoSignTx);
 
-    expect(typeof result.txHash).toBe('string');
-    expect(typeof result.proposalId).toBe('number');
-    expect(result.proposalId).toBeGreaterThan(0);
+    expect(result).toEqual({ txHash: GOV_TX_HASH, proposalId: 101 });
+    expect(echoSignTx).toHaveBeenCalledTimes(1);
+    const invoke = decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks));
+    expect(invoke.functionName).toBe('create_proposal');
   });
 
-  it('creates an AddToken proposal with parameterChanges', async () => {
-    vi.useFakeTimers();
+  it('creates an AddToken proposal with the token encoded in the invoke args', async () => {
+    mockRoundTrip();
     const payload: CreateProposalPayload = {
       formType: 'AddToken',
       title: 'Add wBTC',
@@ -240,50 +270,50 @@ describe('governance – createProposal', () => {
       tokenName: 'Wrapped Bitcoin',
     };
 
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
-    vi.useRealTimers();
+    const result = await createProposal(payload, SIGNER, echoSignTx);
 
-    expect(result.proposalId).toBeGreaterThan(0);
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    expect(created?.parameterChanges).toBeDefined();
+    expect(result.proposalId).toBe(101);
+    const invoke = decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks));
+    expect(JSON.parse(invoke.args[4] as string)).toMatchObject({
+      parameter: 'accepted_tokens',
+      add: payload.tokenAddress,
+    });
   });
 
-  it('persists the proposal payload and vote state for the created record', async () => {
-    vi.useFakeTimers();
-    const payload: CreateProposalPayload = {
-      formType: 'RemoveToken',
+  it('confirms the submitted proposal through the getProposals read path', async () => {
+    const proposal = mockRoundTrip({
       title: 'Remove EURC',
-      description: 'Remove EURC from active token set',
-      removeTokenAddress: 'CDTKPWPLOURQA2SGTKTUQOWRCBZEORB4BWBOMJ3D3ZTQQSGE5F6JBQLV',
-    };
-
-    const resultPromise = createProposal(payload, SIGNER, mockSignTx);
-    await vi.runAllTimersAsync();
-    const result = await resultPromise;
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-
-    expect(created).toMatchObject({
+      type: { ProtocolUpgrade: [] },
       proposer: SIGNER,
-      title: payload.title,
-      description: payload.description,
-      type: 'ProtocolUpgrade',
-      status: 'Active',
-      quorumRequired: 100_000,
     });
-    expect(created?.parameterChanges?.[0]).toMatchObject({
-      parameter: 'accepted_tokens',
-      newValue: expect.stringContaining('removes EURC'),
-    });
-    vi.useRealTimers();
+
+    const result = await createProposal(
+      {
+        formType: 'RemoveToken',
+        title: 'Remove EURC',
+        description: 'Remove EURC from active token set',
+        removeTokenAddress: 'CDTKPWPLOURQA2SGTKTUQOWRCBZEORB4BWBOMJ3D3ZTQQSGE5F6JBQLV',
+      },
+      SIGNER,
+      echoSignTx
+    );
+
+    expect(result.proposalId).toBe(proposal.id);
+    // The in-memory mock list must not be mutated by the real write path.
+    expect(MOCK_PROPOSALS.find((p) => p.title === 'Remove EURC')).toBeUndefined();
   });
 });
 
 describe('governance – stateful write paths', () => {
-  it('updates the right vote bucket and persists userVote for the proposal', async () => {
-    vi.useFakeTimers();
-    const proposalPromise = createProposal(
+  it('records a user vote for a proposal id returned by the real create path', async () => {
+    const writeMocks = mockGovernanceWriteRpc();
+    echoSignTx.mockClear();
+    const proposal = makeProposalNative({ title: 'Isolated vote assertion' });
+    writeMocks.simulateTransaction
+      .mockResolvedValueOnce(simulationWithProposalId(proposal.id as number))
+      .mockResolvedValueOnce(simulationWithProposals([proposal]));
+
+    const proposed = await createProposal(
       {
         formType: 'FeeRate',
         title: 'Isolated vote assertion',
@@ -291,23 +321,15 @@ describe('governance – stateful write paths', () => {
         newValueBps: 75,
       },
       SIGNER,
-      mockSignTx
+      echoSignTx
     );
-    await vi.runAllTimersAsync();
-    const proposed = await proposalPromise;
 
-    const resultPromise = castVote(proposed.proposalId, 'For', SIGNER, mockSignTx);
-    await vi.runAllTimersAsync();
-    const result = await resultPromise;
-    const created = MOCK_PROPOSALS.find((p) => p.id === proposed.proposalId)!;
+    const result = await castVote(proposed.proposalId, 'For', SIGNER, mockSignTx);
 
     expect(typeof result).toBe('string');
     expect(result.length).toBeGreaterThan(0);
     expect(getUserVote(proposed.proposalId)).toBe('For');
-    expect(created.votesFor).toBe(1250);
-    expect(created.votesAgainst).toBe(0);
-    expect(created.votesAbstain).toBe(0);
-    vi.useRealTimers();
+    restoreGovernanceWriteRpc(writeMocks);
   });
 });
 

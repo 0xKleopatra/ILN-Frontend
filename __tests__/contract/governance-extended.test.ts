@@ -10,7 +10,7 @@
  * - getUserVote
  * - MOCK_PROPOSALS / MOCK_VOTES data
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from '@/mocks/server';
 
@@ -34,6 +34,18 @@ import {
   type CreateProposalPayload,
   type Proposal,
 } from '@/utils/governance';
+import {
+  decodeGovernanceInvoke,
+  echoSignTx,
+  firstSimulatedTransaction,
+  GOV_TX_HASH,
+  makeProposalNative,
+  mockGovernanceWriteRpc,
+  restoreGovernanceWriteRpc,
+  simulationWithProposalId,
+  simulationWithProposals,
+  type GovernanceWriteMocks,
+} from '@/utils/__tests__/governance-write-test-utils';
 
 const SIGNER = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const mockSignTx = vi.fn(async (_xdr: string) => 'signedXDR');
@@ -42,25 +54,38 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe('governance – executeProposal', () => {
-  it('returns a transaction hash and sets status to Executed', async () => {
-    vi.useFakeTimers();
-    const proposalId = 6;
-    const promise = executeProposal(proposalId, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const hash = await promise;
-    expect(typeof hash).toBe('string');
-    expect(hash.length).toBeGreaterThan(0);
-    const proposal = MOCK_PROPOSALS.find((p) => p.id === proposalId);
-    expect(proposal?.status).toBe('Executed');
+describe('governance – executeProposal (real transaction)', () => {
+  let writeMocks: GovernanceWriteMocks;
+
+  beforeEach(() => {
+    echoSignTx.mockClear();
+    writeMocks = mockGovernanceWriteRpc();
+    writeMocks.simulateTransaction.mockResolvedValue(simulationWithProposalId(1));
   });
 
-  it('handles non-existent proposal gracefully', async () => {
-    vi.useFakeTimers();
-    const promise = executeProposal(9999, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const hash = await promise;
-    expect(typeof hash).toBe('string');
+  afterEach(() => {
+    restoreGovernanceWriteRpc(writeMocks);
+    vi.restoreAllMocks();
+  });
+
+  it('returns the real submitted hash and submits an execute_proposal invoke', async () => {
+    const statusesBefore = MOCK_PROPOSALS.map((p) => p.status);
+
+    const hash = await executeProposal(6, SIGNER, echoSignTx);
+
+    expect(hash).toBe(GOV_TX_HASH);
+    expect(echoSignTx).toHaveBeenCalledTimes(1);
+    const invoke = decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks));
+    expect(invoke.functionName).toBe('execute_proposal');
+    expect(invoke.args[0]).toBe(BigInt(6));
+    // No in-memory status mutation.
+    expect(MOCK_PROPOSALS.map((p) => p.status)).toEqual(statusesBefore);
+  });
+
+  it('submits the invoke for a non-existent proposal without a mock lookup', async () => {
+    const hash = await executeProposal(9999, SIGNER, echoSignTx);
+    expect(hash).toBe(GOV_TX_HASH);
+    expect(MOCK_PROPOSALS.find((p) => p.id === 9999)).toBeUndefined();
   });
 });
 
@@ -182,57 +207,77 @@ describe('governance – lookupToken', () => {
 });
 
 describe('governance – createProposal extended paths', () => {
-  it('creates a MaxDiscountRate proposal', async () => {
-    vi.useFakeTimers();
+  let writeMocks: GovernanceWriteMocks;
+
+  beforeEach(() => {
+    echoSignTx.mockClear();
+    writeMocks = mockGovernanceWriteRpc();
+  });
+
+  afterEach(() => {
+    restoreGovernanceWriteRpc(writeMocks);
+    vi.restoreAllMocks();
+  });
+
+  function mockRoundTrip(overrides: Record<string, unknown> = {}) {
+    const proposal = makeProposalNative(overrides);
+    writeMocks.simulateTransaction
+      .mockResolvedValueOnce(simulationWithProposalId(proposal.id as number))
+      .mockResolvedValueOnce(simulationWithProposals([proposal]));
+  }
+
+  it('creates a MaxDiscountRate proposal and encodes its action', async () => {
+    mockRoundTrip();
     const payload: CreateProposalPayload = {
       formType: 'MaxDiscountRate',
       title: 'Lower max discount',
       description: 'Reduce max discount rate to 4%',
       newValueBps: 400,
     };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
 
-    expect(result.proposalId).toBeGreaterThan(0);
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    expect(created?.parameterChanges).toBeDefined();
-    expect(created?.parameterChanges?.[0].parameter).toBe('max_discount_rate_bps');
+    const result = await createProposal(payload, SIGNER, echoSignTx);
+
+    expect(result.proposalId).toBe(101);
+    expect(
+      JSON.parse(decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks)).args[4] as string)
+    ).toEqual({
+      parameter: 'max_discount_rate_bps',
+      valueBps: 400,
+    });
   });
 
-  it('creates a RemoveToken proposal', async () => {
-    vi.useFakeTimers();
+  it('creates a RemoveToken proposal and encodes the removed token', async () => {
+    mockRoundTrip();
     const payload: CreateProposalPayload = {
       formType: 'RemoveToken',
       title: 'Remove EURC',
       description: 'Remove EURC from accepted tokens',
       removeTokenAddress: 'CDTKPWPLOURQA2SGTKTUQOWRCBZEORB4BWBOMJ3D3ZTQQSGE5F6JBQLV',
     };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
 
-    expect(result.proposalId).toBeGreaterThan(0);
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    expect(created?.parameterChanges).toBeDefined();
-    expect(created?.parameterChanges?.[0].parameter).toBe('accepted_tokens');
-    expect(created?.parameterChanges?.[0].newValue).toContain('removes EURC');
+    const result = await createProposal(payload, SIGNER, echoSignTx);
+
+    expect(result.proposalId).toBe(101);
+    expect(
+      JSON.parse(decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks)).args[4] as string)
+    ).toMatchObject({
+      parameter: 'accepted_tokens',
+      remove: payload.removeTokenAddress,
+    });
   });
 
-  it('creates a RemoveToken proposal for non-existing token', async () => {
-    vi.useFakeTimers();
+  it('encodes an empty removal target for a non-existing token', async () => {
+    mockRoundTrip();
     const payload: CreateProposalPayload = {
       formType: 'RemoveToken',
       title: 'Remove Unknown',
       description: 'Remove token not in list',
       removeTokenAddress: 'CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
     };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
 
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    expect(created?.parameterChanges?.[0].newValue).not.toContain('removes');
+    const result = await createProposal(payload, SIGNER, echoSignTx);
+    expect(result.proposalId).toBe(101);
+    expect(MOCK_PROPOSALS.find((p) => p.title === 'Remove Unknown')).toBeUndefined();
   });
 });
 
@@ -473,61 +518,75 @@ describe('governance – fetchProtocolParameters values', () => {
   });
 });
 
-describe('governance – createProposal parameter change values', () => {
-  it('FeeRate proposal includes correct current/new values', async () => {
-    vi.useFakeTimers();
-    const payload: CreateProposalPayload = {
-      formType: 'FeeRate',
-      title: 'Lower fee',
-      description: 'Reduce fee',
-      newValueBps: 30,
-    };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
-    vi.useRealTimers();
+describe('governance – createProposal submitted action values', () => {
+  let writeMocks: GovernanceWriteMocks;
 
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    const change = created?.parameterChanges?.[0];
-    expect(change?.parameter).toBe('fee_rate_bps');
-    expect(change?.currentValue).toContain('50');
-    expect(change?.newValue).toContain('30');
-    expect(change?.newValue).toContain('0.3');
+  beforeEach(() => {
+    echoSignTx.mockClear();
+    writeMocks = mockGovernanceWriteRpc();
+    const proposal = makeProposalNative();
+    writeMocks.simulateTransaction
+      .mockResolvedValueOnce(simulationWithProposalId(proposal.id as number))
+      .mockResolvedValueOnce(simulationWithProposals([proposal]));
   });
 
-  it('MaxDiscountRate proposal includes correct parameter name', async () => {
-    vi.useFakeTimers();
-    const payload: CreateProposalPayload = {
-      formType: 'MaxDiscountRate',
-      title: 'Lower discount',
-      description: 'Reduce discount',
-      newValueBps: 350,
-    };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
-    vi.useRealTimers();
-
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    expect(created?.parameterChanges?.[0].parameter).toBe('max_discount_rate_bps');
+  afterEach(() => {
+    restoreGovernanceWriteRpc(writeMocks);
+    vi.restoreAllMocks();
   });
 
-  it('AddToken proposal includes token name in new value', async () => {
-    vi.useFakeTimers();
-    const payload: CreateProposalPayload = {
-      formType: 'AddToken',
-      title: 'Add wBTC',
-      description: 'Add wrapped Bitcoin',
-      tokenAddress: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
-      tokenName: 'Wrapped Bitcoin',
-    };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
-    vi.useRealTimers();
+  function submittedAction(): Record<string, unknown> {
+    const invoke = decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks));
+    return JSON.parse(invoke.args[4] as string);
+  }
 
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    expect(created?.parameterChanges?.[0].newValue).toContain('Wrapped Bitcoin');
+  it('FeeRate proposal includes the new basis-point value', async () => {
+    await createProposal(
+      {
+        formType: 'FeeRate',
+        title: 'Lower fee',
+        description: 'Reduce fee',
+        newValueBps: 30,
+      },
+      SIGNER,
+      echoSignTx
+    );
+
+    expect(submittedAction()).toEqual({ parameter: 'fee_rate_bps', valueBps: 30 });
+  });
+
+  it('MaxDiscountRate proposal includes the correct parameter name', async () => {
+    await createProposal(
+      {
+        formType: 'MaxDiscountRate',
+        title: 'Lower discount',
+        description: 'Reduce discount',
+        newValueBps: 350,
+      },
+      SIGNER,
+      echoSignTx
+    );
+
+    expect(submittedAction()).toEqual({ parameter: 'max_discount_rate_bps', valueBps: 350 });
+  });
+
+  it('AddToken proposal includes the token address in the submitted action', async () => {
+    await createProposal(
+      {
+        formType: 'AddToken',
+        title: 'Add wBTC',
+        description: 'Add wrapped Bitcoin',
+        tokenAddress: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+        tokenName: 'Wrapped Bitcoin',
+      },
+      SIGNER,
+      echoSignTx
+    );
+
+    expect(submittedAction()).toMatchObject({
+      parameter: 'accepted_tokens',
+      add: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+    });
   });
 });
 
@@ -551,26 +610,16 @@ describe('governance – castVote / executeProposal tx-hash generation fallback'
     warnSpy.mockRestore();
   });
 
-  it('executeProposal logs a warning and falls back to a random hash when hash generation throws', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const randomSpy = vi.spyOn(Math, 'random').mockImplementationOnce(() => {
-      throw new Error('entropy source unavailable');
-    });
+  it('executeProposal surfaces submission errors instead of fabricating a hash', async () => {
+    const writeMocks = mockGovernanceWriteRpc();
+    writeMocks.simulateTransaction.mockResolvedValueOnce(simulationWithProposalId(7));
+    writeMocks.sendTransaction.mockResolvedValueOnce({ status: 'REJECTED', hash: GOV_TX_HASH });
 
-    vi.useFakeTimers();
-    const promise = executeProposal(7, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const hash = await promise;
-
-    expect(typeof hash).toBe('string');
-    expect(hash.length).toBeGreaterThan(0);
-    expect(warnSpy).toHaveBeenCalledWith(
-      'On-chain proposal execution fallback:',
-      expect.any(Error)
+    await expect(executeProposal(7, SIGNER, echoSignTx)).rejects.toThrow(
+      /Transaction submission failed with status REJECTED/
     );
 
-    randomSpy.mockRestore();
-    warnSpy.mockRestore();
+    restoreGovernanceWriteRpc(writeMocks);
   });
 });
 
@@ -595,19 +644,29 @@ describe('governance – castVote / executeProposal branch edge cases', () => {
     expect(hash.length).toBeGreaterThan(0);
   });
 
-  it('executeProposal skips the on-chain attempt entirely when signerAddress is empty', async () => {
-    vi.useFakeTimers();
-    const promise = executeProposal(6, '', mockSignTx);
-    vi.runAllTimers();
-    const hash = await promise;
-    expect(typeof hash).toBe('string');
-    expect(hash.length).toBeGreaterThan(0);
+  it('executeProposal rejects an empty signer instead of fabricating a hash', async () => {
+    await expect(executeProposal(6, '', echoSignTx)).rejects.toThrow();
   });
 });
 
 describe('governance – createProposal fallback branches', () => {
-  it('AddToken proposal falls back to a truncated address when tokenName is omitted', async () => {
-    vi.useFakeTimers();
+  let writeMocks: GovernanceWriteMocks;
+
+  beforeEach(() => {
+    echoSignTx.mockClear();
+    writeMocks = mockGovernanceWriteRpc();
+    const proposal = makeProposalNative();
+    writeMocks.simulateTransaction
+      .mockResolvedValueOnce(simulationWithProposalId(proposal.id as number))
+      .mockResolvedValueOnce(simulationWithProposals([proposal]));
+  });
+
+  afterEach(() => {
+    restoreGovernanceWriteRpc(writeMocks);
+    vi.restoreAllMocks();
+  });
+
+  it('AddToken proposal submits the token address even when tokenName is omitted', async () => {
     const payload: CreateProposalPayload = {
       formType: 'AddToken',
       title: 'Add unnamed token',
@@ -615,68 +674,54 @@ describe('governance – createProposal fallback branches', () => {
       tokenAddress: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
       // tokenName intentionally omitted
     };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
-    vi.useRealTimers();
 
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    // Falls back to payload.tokenAddress.slice(0, 6) since tokenName is undefined
-    expect(created?.parameterChanges?.[0].newValue).toContain('CDLZFC');
+    const result = await createProposal(payload, SIGNER, echoSignTx);
+    expect(result.proposalId).toBe(101);
+    const action = JSON.parse(
+      decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks)).args[4] as string
+    );
+    expect(action.add).toContain('CDLZFC');
   });
 
-  it('RemoveToken proposal without a removeTokenAddress produces no parameterChanges', async () => {
-    vi.useFakeTimers();
+  it('RemoveToken proposal without a removeTokenAddress submits an empty target', async () => {
     const payload: CreateProposalPayload = {
       formType: 'RemoveToken',
       title: 'Remove token (missing address)',
       description: 'RemoveToken form submitted without a target address',
       // removeTokenAddress intentionally omitted
     };
-    const promise = createProposal(payload, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    const result = await promise;
-    vi.useRealTimers();
 
-    const created = MOCK_PROPOSALS.find((p) => p.id === result.proposalId);
-    expect(created?.parameterChanges).toBeUndefined();
+    const result = await createProposal(payload, SIGNER, echoSignTx);
+    expect(result.proposalId).toBe(101);
+    const action = JSON.parse(
+      decodeGovernanceInvoke(firstSimulatedTransaction(writeMocks)).args[4] as string
+    );
+    expect(action.remove).toBe('');
   });
 });
 
 describe('governance – fetchParameterUpdates executableAfter fallback', () => {
   it('falls back to votingEndsAt as updatedAt when an executed proposal has no executableAfter', async () => {
-    vi.useFakeTimers();
+    const proposal = makeProposalNative({
+      id: 303,
+      status: { Executed: [] },
+      parameter_changes: [
+        {
+          parameter: 'fee_rate_bps',
+          current_value: '50 (0.5%)',
+          new_value: '40 (0.4%)',
+        },
+      ],
+    });
+    const readMocks = mockGovernanceWriteRpc();
+    readMocks.simulateTransaction.mockResolvedValue(simulationWithProposals([proposal]));
 
-    // Create a fresh proposal (status Active, no executableAfter set anywhere
-    // in the creation path) then execute it — executeProposal only flips
-    // status to 'Executed', it never sets executableAfter.
-    const createPromise = createProposal(
-      {
-        formType: 'FeeRate',
-        title: 'Fallback updatedAt proposal',
-        description: 'Exercises the executableAfter ?? votingEndsAt fallback',
-        newValueBps: 40,
-      },
-      SIGNER,
-      mockSignTx
-    );
-    vi.runAllTimers();
-    const { proposalId } = await createPromise;
+    const updates = await fetchParameterUpdates();
+    const update = updates.find((u) => u.proposalId === 303);
 
-    const execPromise = executeProposal(proposalId, SIGNER, mockSignTx);
-    vi.runAllTimers();
-    await execPromise;
-
-    const updatesPromise = fetchParameterUpdates();
-    vi.runAllTimers();
-    const updates = await updatesPromise;
-    vi.useRealTimers();
-
-    const created = MOCK_PROPOSALS.find((p) => p.id === proposalId)!;
-    const update = updates.find((u) => u.proposalId === proposalId);
     expect(update).toBeDefined();
-    expect(created.executableAfter).toBeUndefined();
-    expect(update!.updatedAt).toBe(created.votingEndsAt);
+    expect(update!.updatedAt).toBe(proposal.voting_ends_at);
+    restoreGovernanceWriteRpc(readMocks);
   });
 });
 

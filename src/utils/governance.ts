@@ -2,7 +2,9 @@ import {
   rpc,
   xdr,
   scValToNative,
+  nativeToScVal,
   TransactionBuilder,
+  Transaction,
   Account,
   BASE_FEE,
   Operation,
@@ -20,6 +22,9 @@ import {
 
 const server = new rpc.Server(RPC_URL);
 const READ_ACCOUNT = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+const GOVERNANCE_TX_TIMEOUT_SECONDS = 60;
+const TX_POLL_ATTEMPTS = 20;
+const ACCEPTED_SEND_STATUSES = new Set(['PENDING', 'DUPLICATE']);
 
 function buildGovernanceReadTransaction(method: string, params: xdr.ScVal[] = []) {
   return new TransactionBuilder(new Account(READ_ACCOUNT, '0'), {
@@ -51,6 +56,71 @@ function buildTokenReadTransaction(contractId: string, method: string, params: x
     )
     .setTimeout(30)
     .build();
+}
+
+/**
+ * Build an unsigned `invokeContractFunction` transaction against the governance
+ * contract, sourced from the wallet that will sign it. Mirrors the write path
+ * used by `submitInvoiceTransaction` in `soroban.ts`.
+ */
+async function buildGovernanceWriteTransaction(
+  method: string,
+  args: xdr.ScVal[],
+  signerAddress: string
+): Promise<Transaction> {
+  const account = await server.getAccount(signerAddress);
+  return new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(
+      Operation.invokeContractFunction({
+        contract: GOVERNANCE_CONTRACT_ID,
+        function: method,
+        args,
+      })
+    )
+    .setTimeout(GOVERNANCE_TX_TIMEOUT_SECONDS)
+    .build();
+}
+
+/** Throw a descriptive error when a governance write transaction fails simulation. */
+function assertSimulationSuccess(
+  simulated: Parameters<typeof rpc.Api.isSimulationSuccess>[0],
+  fallbackMessage: string
+): void {
+  if (!rpc.Api.isSimulationSuccess(simulated)) {
+    const message = 'error' in simulated ? simulated.error : fallbackMessage;
+    throw new Error(`Simulation failed: ${message}`);
+  }
+}
+
+/**
+ * Prepare, sign via the wallet callback, submit and confirm a built governance
+ * transaction. Returns the real on-chain transaction hash.
+ */
+async function submitGovernanceTransaction(
+  tx: Transaction,
+  signTx: (txXdr: string) => Promise<string>
+): Promise<string> {
+  const prepared = await server.prepareTransaction(tx);
+  const signedXdr = await signTx(prepared.toXDR());
+  const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as Transaction;
+  const sent = await server.sendTransaction(signedTx);
+
+  if (!sent.hash || !sent.status) {
+    throw new Error('RPC server returned an invalid response for governance transaction.');
+  }
+  if (!ACCEPTED_SEND_STATUSES.has(sent.status)) {
+    throw new Error(`Transaction submission failed with status ${sent.status}.`);
+  }
+
+  const finalResult = await server.pollTransaction(sent.hash, { attempts: TX_POLL_ATTEMPTS });
+  if (finalResult.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+    throw new Error(`Transaction failed with status ${String(finalResult.status)}.`);
+  }
+
+  return sent.hash;
 }
 
 // ─── Horizon helpers for governance events ────────────────────────────────────
@@ -480,29 +550,18 @@ export async function castVote(
 export async function executeProposal(
   proposalId: number,
   signerAddress: string,
-  _signTx: (xdr: string) => Promise<string>
+  signTx: (xdr: string) => Promise<string>
 ): Promise<string> {
-  // TODO: Replace with actual Soroban transaction once governance contract is deployed
-  // Ref: #111
-  await new Promise((r) => setTimeout(r, 2000));
+  const args: xdr.ScVal[] = [
+    nativeToScVal(proposalId, { type: 'u64' }),
+    Address.fromString(signerAddress).toScVal(),
+  ];
 
-  const proposal = MOCK_PROPOSALS.find((p) => p.id === proposalId);
-  if (proposal) {
-    proposal.status = 'Executed';
-  }
+  const tx = await buildGovernanceWriteTransaction('execute_proposal', args, signerAddress);
+  const simulated = await server.simulateTransaction(tx);
+  assertSimulationSuccess(simulated, 'Unable to simulate proposal execution.');
 
-  if (signerAddress) {
-    try {
-      const mockTxHash = Array.from({ length: 32 }, () =>
-        Math.floor(Math.random() * 16).toString(16)
-      ).join('');
-      return mockTxHash;
-    } catch (err) {
-      console.warn('On-chain proposal execution fallback:', err);
-    }
-  }
-
-  return Math.random().toString(16).substring(2, 18);
+  return submitGovernanceTransaction(tx, signTx);
 }
 
 export async function vetoProposal(
@@ -733,23 +792,49 @@ export async function lookupToken(address: string): Promise<AcceptedToken> {
   };
 }
 
+/** Encode the form payload into the action argument for `create_proposal`. */
+function encodeProposalAction(payload: CreateProposalPayload): string {
+  switch (payload.formType) {
+    case 'FeeRate':
+      return JSON.stringify({ parameter: 'fee_rate_bps', valueBps: payload.newValueBps ?? 0 });
+    case 'MaxDiscountRate':
+      return JSON.stringify({
+        parameter: 'max_discount_rate_bps',
+        valueBps: payload.newValueBps ?? 0,
+      });
+    case 'AddToken':
+      return JSON.stringify({ parameter: 'accepted_tokens', add: payload.tokenAddress ?? '' });
+    case 'RemoveToken':
+      return JSON.stringify({
+        parameter: 'accepted_tokens',
+        remove: payload.removeTokenAddress ?? '',
+      });
+    default:
+      return JSON.stringify({});
+  }
+}
+
+/** Parse the proposal id returned by a successful `create_proposal` simulation. */
+function parseSimulatedProposalId(retval: xdr.ScVal): number | undefined {
+  try {
+    const id = Number(scValToNative(retval));
+    return Number.isFinite(id) && id > 0 ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * Submit a new governance proposal to the contract.
- * TODO: Replace with actual Soroban transaction once governance contract is deployed.
- * Ref: #111
+ * Submit a new governance proposal to the contract as a real Soroban
+ * transaction. The proposer and wallet signing callback are wired through,
+ * the real submitted hash is returned, and the created proposal is confirmed
+ * via the live `getProposals()` read path.
  */
 export async function createProposal(
   payload: CreateProposalPayload,
-  _signerAddress: string,
-  _signTx: (xdr: string) => Promise<string>
+  signerAddress: string,
+  signTx: (xdr: string) => Promise<string>
 ): Promise<{ txHash: string; proposalId: number }> {
-  await new Promise((r) => setTimeout(r, 2500));
-
-  const newId = MOCK_PROPOSALS.length + 1;
-  const NOW_SEC = Math.floor(Date.now() / 1000);
-  const DAY_SEC = 86400;
-
-  // Map form type → internal ProposalType
   const typeMap: Record<CreateProposalFormType, ProposalType> = {
     FeeRate: 'ParameterUpdate',
     MaxDiscountRate: 'ParameterUpdate',
@@ -757,77 +842,37 @@ export async function createProposal(
     RemoveToken: 'ProtocolUpgrade',
   };
 
-  // Map form type → parameter change
-  let parameterChanges: ParameterChange[] | undefined;
-  if (payload.formType === 'FeeRate' && payload.newValueBps !== undefined) {
-    parameterChanges = [
-      {
-        parameter: 'fee_rate_bps',
-        currentValue: `${MOCK_PROTOCOL_PARAMS.feeRateBps} (${
-          MOCK_PROTOCOL_PARAMS.feeRateBps / 100
-        }%)`,
-        newValue: `${payload.newValueBps} (${payload.newValueBps / 100}%)`,
-      },
-    ];
-  } else if (payload.formType === 'MaxDiscountRate' && payload.newValueBps !== undefined) {
-    parameterChanges = [
-      {
-        parameter: 'max_discount_rate_bps',
-        currentValue: `${MOCK_PROTOCOL_PARAMS.maxDiscountRateBps} (${
-          MOCK_PROTOCOL_PARAMS.maxDiscountRateBps / 100
-        }%)`,
-        newValue: `${payload.newValueBps} (${payload.newValueBps / 100}%)`,
-      },
-    ];
-  } else if (payload.formType === 'AddToken' && payload.tokenAddress) {
-    const existing = MOCK_PROTOCOL_PARAMS.acceptedTokens.map((t) => t.symbol);
-    parameterChanges = [
-      {
-        parameter: 'accepted_tokens',
-        currentValue: `[${existing.join(', ')}]`,
-        newValue: `[${existing.join(', ')}, ${
-          payload.tokenName ?? payload.tokenAddress.slice(0, 6)
-        }]`,
-      },
-    ];
-  } else if (payload.formType === 'RemoveToken' && payload.removeTokenAddress) {
-    const token = MOCK_PROTOCOL_PARAMS.acceptedTokens.find(
-      (t) => t.address === payload.removeTokenAddress
-    );
-    const remaining = MOCK_PROTOCOL_PARAMS.acceptedTokens
-      .filter((t) => t.address !== payload.removeTokenAddress)
-      .map((t) => t.symbol);
-    parameterChanges = [
-      {
-        parameter: 'accepted_tokens',
-        currentValue: `[${MOCK_PROTOCOL_PARAMS.acceptedTokens.map((t) => t.symbol).join(', ')}]`,
-        newValue: `[${remaining.join(', ')}]${token ? ` (removes ${token.symbol})` : ''}`,
-      },
-    ];
+  const args: xdr.ScVal[] = [
+    Address.fromString(signerAddress).toScVal(),
+    nativeToScVal(payload.title),
+    nativeToScVal(payload.description),
+    nativeToScVal(typeMap[payload.formType]),
+    nativeToScVal(encodeProposalAction(payload)),
+  ];
+
+  const tx = await buildGovernanceWriteTransaction('create_proposal', args, signerAddress);
+  const simulated = await server.simulateTransaction(tx);
+  if (!rpc.Api.isSimulationSuccess(simulated) || !simulated.result?.retval) {
+    const message =
+      'error' in simulated ? simulated.error : 'Unable to simulate proposal creation.';
+    throw new Error(`Simulation failed: ${message}`);
   }
 
-  const newProposal: Proposal = {
-    id: newId,
-    title: payload.title,
-    description: payload.description,
-    type: typeMap[payload.formType],
-    status: 'Active',
-    proposer: _signerAddress,
-    createdAt: NOW_SEC,
-    votingStartsAt: NOW_SEC,
-    votingEndsAt: NOW_SEC + 7 * DAY_SEC,
-    votesFor: 0,
-    votesAgainst: 0,
-    quorumRequired: 100_000,
-    parameterChanges,
-  };
+  const simulatedProposalId = parseSimulatedProposalId(simulated.result.retval);
+  const txHash = await submitGovernanceTransaction(tx, signTx);
 
-  MOCK_PROPOSALS.push(newProposal);
+  // Round-trip: confirm the submitted proposal is visible through the already
+  // real getProposals() read path before reporting success to the caller.
+  const proposals = await getProposals();
+  const created =
+    (simulatedProposalId !== undefined && proposals.find((p) => p.id === simulatedProposalId)) ||
+    proposals.find((p) => p.title === payload.title && p.proposer === signerAddress);
 
-  return {
-    txHash: Math.random().toString(16).substring(2, 18),
-    proposalId: newId,
-  };
+  if (!created) {
+    throw new Error('Created proposal could not be confirmed via getProposals.');
+  }
+
+  return { txHash, proposalId: created.id };
 }
 
 // ─── Parameter change announcements (#153) ────────────────────────────────────

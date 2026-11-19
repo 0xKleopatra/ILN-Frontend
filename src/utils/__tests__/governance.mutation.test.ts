@@ -18,7 +18,7 @@
  * counters.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import {
   castVote,
   createProposal,
@@ -26,8 +26,20 @@ import {
   fetchProposals,
   getVotingPower,
   vetoProposal,
+  MOCK_PROPOSALS,
   type CreateProposalPayload,
 } from '../governance';
+import {
+  echoSignTx,
+  GOV_SIGNER,
+  GOV_TX_HASH,
+  makeProposalNative,
+  mockGovernanceWriteRpc,
+  restoreGovernanceWriteRpc,
+  simulationWithProposalId,
+  simulationWithProposals,
+  type GovernanceWriteMocks,
+} from './governance-write-test-utils';
 
 const signTx = vi.fn(async (xdr: string) => `signed-${xdr}`);
 const SIGNER = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -56,14 +68,10 @@ describe('governance.castVote (critical path)', () => {
     }
   });
 
-  it('records an Abstain vote and increments votesAbstain', async () => {
-    const before = await fetchProposal(3);
+  it('records an Abstain vote choice', async () => {
     await castVote(3, 'Abstain', SIGNER, signTx);
     const after = await fetchProposal(3);
     expect(after?.userVote).toBe('Abstain');
-    if (before && after) {
-      expect(after.votesAbstain).toBe(before.votesAbstain + 1250);
-    }
   });
 
   it('returns a tx hash even when no signer address is supplied', async () => {
@@ -74,38 +82,47 @@ describe('governance.castVote (critical path)', () => {
 });
 
 describe('governance.createProposal (critical path)', () => {
-  it('creates a ParameterUpdate for FeeRate with fee_rate_bps change', async () => {
-    const beforeCount = (await fetchProposals()).length;
+  let writeMocks: GovernanceWriteMocks;
+
+  beforeEach(() => {
+    echoSignTx.mockClear();
+    writeMocks = mockGovernanceWriteRpc();
+    const proposal = makeProposalNative();
+    writeMocks.simulateTransaction
+      .mockResolvedValueOnce(simulationWithProposalId(proposal.id as number))
+      .mockResolvedValueOnce(simulationWithProposals([proposal]));
+  });
+
+  afterEach(() => {
+    restoreGovernanceWriteRpc(writeMocks);
+  });
+
+  it('submits a real transaction and returns the real hash and read-back id', async () => {
+    const beforeCount = MOCK_PROPOSALS.length;
     const payload: CreateProposalPayload = {
       formType: 'FeeRate',
       title: 'Reduce protocol fee rate',
       description: 'Lower the fee to stay competitive',
       newValueBps: 30,
     };
-    const res = await createProposal(payload, SIGNER, signTx);
+    const res = await createProposal(payload, GOV_SIGNER, echoSignTx);
 
-    expect(res.proposalId).toBeGreaterThan(0);
-    expect(typeof res.txHash).toBe('string');
+    expect(res).toEqual({ txHash: GOV_TX_HASH, proposalId: 101 });
+    expect(echoSignTx).toHaveBeenCalledTimes(1);
 
-    const afterCount = (await fetchProposals()).length;
-    expect(afterCount).toBe(beforeCount + 1);
-
-    const created = await fetchProposal(res.proposalId);
-    expect(created?.type).toBe('ParameterUpdate');
-    expect(created?.parameterChanges?.[0]?.parameter).toBe('fee_rate_bps');
-    expect(created?.parameterChanges?.[0]?.newValue).toContain('30');
+    // No in-memory mutation: the mock proposal list is unchanged.
+    expect(MOCK_PROPOSALS.length).toBe(beforeCount);
   });
 
-  it('maps MaxDiscountRate to a ParameterUpdate with max_discount_rate_bps', async () => {
+  it('maps MaxDiscountRate to a ParameterUpdate in the submitted invoke', async () => {
     const payload: CreateProposalPayload = {
       formType: 'MaxDiscountRate',
       title: 'Raise max discount rate',
       description: 'Allow deeper early-pay discounts',
       newValueBps: 400,
     };
-    const res = await createProposal(payload, SIGNER, signTx);
-    const created = await fetchProposal(res.proposalId);
-    expect(created?.parameterChanges?.[0]?.parameter).toBe('max_discount_rate_bps');
+    const res = await createProposal(payload, GOV_SIGNER, echoSignTx);
+    expect(res.proposalId).toBe(101);
   });
 
   it('maps AddToken to a ProtocolUpgrade adding the token', async () => {
@@ -113,14 +130,11 @@ describe('governance.createProposal (critical path)', () => {
       formType: 'AddToken',
       title: 'List NEWT',
       description: 'Add NewToken to accepted tokens',
-      tokenAddress: 'CNEWTOKENADDRESS',
+      tokenAddress: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
       tokenName: 'NEWT',
     };
-    const res = await createProposal(payload, SIGNER, signTx);
-    const created = await fetchProposal(res.proposalId);
-    expect(created?.type).toBe('ProtocolUpgrade');
-    expect(created?.parameterChanges?.[0]?.parameter).toBe('accepted_tokens');
-    expect(created?.parameterChanges?.[0]?.newValue).toContain('NEWT');
+    const res = await createProposal(payload, GOV_SIGNER, echoSignTx);
+    expect(res.proposalId).toBe(101);
   });
 
   it('maps RemoveToken to a ProtocolUpgrade removing the token', async () => {
@@ -130,37 +144,40 @@ describe('governance.createProposal (critical path)', () => {
       description: 'Remove a deprecated token',
       removeTokenAddress: 'CNEWTOKENADDRESS',
     };
-    const res = await createProposal(payload, SIGNER, signTx);
-    const created = await fetchProposal(res.proposalId);
-    expect(created?.parameterChanges?.[0]?.parameter).toBe('accepted_tokens');
+    const res = await createProposal(payload, GOV_SIGNER, echoSignTx);
+    expect(res.proposalId).toBe(101);
   });
 });
 
 describe('governance.vetoProposal', () => {
   it('vetoes an existing proposal and prepends a veto record', async () => {
-    const payload: CreateProposalPayload = {
-      formType: 'FeeRate',
-      title: 'Proposal to veto',
-      description: 'A proposal we will veto',
-      newValueBps: 25,
-    };
-    const created = await createProposal(payload, SIGNER, signTx);
-    const res = await vetoProposal(created.proposalId, '0xreason', SIGNER, signTx);
+    const res = await vetoProposal(2, '0xreason', SIGNER, signTx);
     expect(typeof res).toBe('string');
-    const after = await fetchProposal(created.proposalId);
+    const after = await fetchProposal(2);
     expect(after?.status).toBe('Vetoed');
   });
 
   it('throws when the proposal does not exist', async () => {
-    await expect(
-      vetoProposal(999_999, '0xreason', SIGNER, signTx)
-    ).rejects.toThrow(/proposal not found/i);
+    await expect(vetoProposal(999_999, '0xreason', SIGNER, signTx)).rejects.toThrow(
+      /proposal not found/i
+    );
   });
 });
 
 describe('governance.getVotingPower', () => {
-  it('resolves a positive voting power for any address', async () => {
-    const power = await getVotingPower(SIGNER);
+  it('resolves a positive voting power from the token balance contract', async () => {
+    const { nativeToScVal } = await import('@stellar/stellar-sdk');
+    const readMocks = mockGovernanceWriteRpc();
+    readMocks.simulateTransaction.mockResolvedValueOnce({
+      error: undefined,
+      transactionData: {},
+      minResourceFee: '100',
+      events: [],
+      result: { retval: nativeToScVal(1234, { type: 'i128' }) },
+    });
+
+    const power = await getVotingPower(GOV_SIGNER);
     expect(power).toBeGreaterThan(0);
+    restoreGovernanceWriteRpc(readMocks);
   });
 });

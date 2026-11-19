@@ -333,7 +333,7 @@ export default function NewGovernanceProposalPage() {
     setStage(null);
     try {
       const { proposalId } = await createProposal(payload, address, signTx, {
-        walletNetwork,
+        walletNetwork: walletNetwork ?? undefined,
         context: toValidationContext(protocolParams),
         onStage: (stage) => setStage(stage as CreateProposalStage),
         onConfirmed: async () => {

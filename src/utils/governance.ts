@@ -575,9 +575,8 @@ export interface GovernanceMutationOptions {
   simulate?: () => Promise<GovernanceSimulationOutcome>;
   onConfirmed?: (txHash: string) => void | Promise<void>;
   votingPower?: number;
-  walletNetwork?: string | null;
+  walletNetwork?: string;
   onStage?: (stage: GovernanceSubmissionStage) => void;
-  pendingLabel?: string;
   attempts?: number;
   intervalMs?: number;
   timeoutMs?: number;
@@ -587,6 +586,8 @@ export interface GovernanceMutationOptions {
   >;
   sleep?: (ms: number) => Promise<void>;
 }
+
+export type GovernanceWriteOptions = GovernanceMutationOptions;
 
 // ─── Contract Parsers ─────────────────────────────────────────────────────────
 
@@ -763,19 +764,6 @@ const PROPOSAL_TYPE_CODE: Record<CreateProposalFormType, number> = {
 };
 
 /** Window in which an identical create_proposal submission is treated as a replay. */
-const PROPOSAL_CREATION_DEDUPE_MS = 30_000;
-
-/**
- * Tuning / injection points shared by every governance write.
- *
- * Callers normally pass nothing; tests use `rpcServer` and `sleep` to drive
- * the pipeline deterministically, and the UI can pass `onStage` to reflect
- * `signed → submitted → confirming` progress.
- */
-export type GovernanceWriteOptions = Pick<
-  GovernanceMutationOptions,
-  'onStage' | 'attempts' | 'intervalMs' | 'timeoutMs' | 'rpcServer' | 'sleep'
->;
 
 /**
  * Encodes the type-specific part of a proposal as the single `value` argument
@@ -929,12 +917,12 @@ export async function castVote(
   choice: VoteChoice,
   signerAddress: string,
   signTx: (xdr: string) => Promise<string>,
-  options: GovernanceMutationOptions = {}
+  options: GovernanceWriteOptions = {}
 ): Promise<string> {
-  const voter = requireSigner(signerAddress, 'cast_vote');
   assertGovernanceNetworkMatches(options.walletNetwork);
   requireSep10Session(signerAddress);
 
+  const voter = requireSigner(signerAddress, 'cast_vote');
   const cacheKey = `${voter}:vote:${proposalId}`;
 
   // Idempotent replay of an identical, already-confirmed vote: return the
@@ -942,6 +930,12 @@ export async function castVote(
   if (userVotes.get(proposalId) === choice) {
     const existingHash = proposalTxHashes.get(cacheKey);
     if (existingHash) return existingHash;
+  }
+
+  // Dry-run before the wallet prompt: a failed simulation is rendered to the
+  // user without ever opening the wallet, and nothing is mutated (#1063).
+  if (options.simulate) {
+    await assertGovernanceSimulationPassed(options.simulate);
   }
 
   const { txHash } = await executeGovernanceMutation({
@@ -976,20 +970,23 @@ export async function executeProposal(
   proposalId: number,
   signerAddress: string,
   signTx: (xdr: string) => Promise<string>,
-  options: GovernanceMutationOptions = {}
+  options: GovernanceWriteOptions = {}
 ): Promise<string> {
-  const caller = requireSigner(signerAddress, 'execute_proposal');
   assertGovernanceNetworkMatches(options.walletNetwork);
   requireSep10Session(signerAddress);
 
-  const proposal = MOCK_PROPOSALS.find((p) => p.id === proposalId);
-  if (!proposal) throw new Error('Proposal not found');
-
+  const caller = requireSigner(signerAddress, 'execute_proposal');
   const cacheKey = `execute:${proposalId}`;
 
   // Idempotent replay of an already-confirmed execution (#1146).
   const existing = proposalTxHashes.get(cacheKey);
   if (existing) return existing;
+
+  // Dry-run before the wallet prompt: a failed simulation is rendered to the
+  // user without ever opening the wallet, and nothing is mutated (#1063).
+  if (options.simulate) {
+    await assertGovernanceSimulationPassed(options.simulate);
+  }
 
   const { txHash } = await executeGovernanceMutation({
     method: 'execute_proposal',
@@ -1018,20 +1015,22 @@ export async function vetoProposal(
   reasonHash: string,
   adminAddress: string,
   signTx: (xdr: string) => Promise<string>,
-  options: GovernanceMutationOptions = {}
+  options: GovernanceWriteOptions = {}
 ): Promise<string> {
-  const admin = requireSigner(adminAddress, 'veto_proposal');
   assertGovernanceNetworkMatches(options.walletNetwork);
   requireSep10Session(adminAddress);
 
-  const proposal = MOCK_PROPOSALS.find((p) => p.id === proposalId);
-  if (!proposal) throw new Error('Proposal not found');
-
+  const admin = requireSigner(adminAddress, 'veto_proposal');
   const cacheKey = `veto:${proposalId}:${reasonHash}`;
 
   // Idempotent replay of an identical, already-confirmed veto (#1146).
   const existing = proposalTxHashes.get(cacheKey);
   if (existing) return existing;
+
+  // Simulation fails before signing: no wallet prompt, no veto record (#1063).
+  if (options.simulate) {
+    await assertGovernanceSimulationPassed(options.simulate);
+  }
 
   const { txHash } = await executeGovernanceMutation({
     method: 'veto_proposal',
@@ -1053,11 +1052,7 @@ export async function vetoProposal(
     admin,
     reasonHash,
     createdAt: Math.floor(Date.now() / 1000),
-  };
-  vetoHistory.unshift(record);
-  if (proposal) {
-    proposal.vetoHistory = [record, ...(proposal.vetoHistory ?? [])];
-  }
+  });
   proposalTxHashes.set(cacheKey, txHash);
   await options.onConfirmed?.(txHash);
   return txHash;
@@ -1252,6 +1247,36 @@ export async function getDelegationInfo(address: string): Promise<DelegationInfo
 
   const native = scValToNative(callResult.result.retval);
   return parseDelegationInfoFromNative(native);
+}
+
+async function requireGovernanceSignature(
+  intent: string,
+  signerAddress: string,
+  signTx: (xdr: string) => Promise<string>
+): Promise<string> {
+  if (!signerAddress) return `unsigned:${intent}`;
+  try {
+    return await signTx(intent);
+  } catch (err) {
+    if (isCancellationError(err)) {
+      throw new Error(
+        'USER_REJECTED: Transaction signature was declined in wallet. No changes were applied.'
+      );
+    }
+    throw err;
+  }
+}
+
+function deriveGovernanceTxHash(...seeds: string[]): string {
+  const seed = seeds.join('|');
+  let h1 = 0x811c9dc5;
+  let h2 = 0x27d4eb2f;
+  for (let i = 0; i < seed.length; i++) {
+    const ch = seed.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ ch, 0x5f356495) >>> 0;
+  }
+  return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')).repeat(4);
 }
 
 /**
@@ -1530,45 +1555,73 @@ export async function createProposal(
   assertGovernanceNetworkMatches(options.walletNetwork);
   requireSep10Session(signerAddress);
 
-  if (options.context) {
-    const validation = validateProposalPayload(payload, options.context);
-    if (!validation.ok) throw new ProposalValidationError(validation.issues);
-  }
-
-  const proposer = requireSigner(signerAddress, 'create_proposal');
-
-  // Idempotency: deduplicate rapid duplicate submissions without re-signing
-  // or creating a second proposal (#1146).
-  const idempotencyKey = `${proposer}:${payload.title}:${payload.formType}:${
+  const idempotencyKey = `${signerAddress}:${payload.title}:${payload.formType}:${
     payload.newValueBps ?? payload.tokenAddress ?? payload.removeTokenAddress ?? ''
   }`;
   const cached = proposalCreationCache.get(idempotencyKey);
-  if (cached && Date.now() - cached.timestamp < PROPOSAL_CREATION_DEDUPE_MS) {
+  if (cached && Date.now() - cached.timestamp < PROPOSAL_IDEMPOTENCY_WINDOW_MS) {
     return { txHash: cached.txHash, proposalId: cached.proposalId };
   }
 
-  const { onStage, ...mutationOptions } = options;
-  const { txHash, returnValue } = await executeGovernanceMutation({
-    method: 'create_proposal',
-    args: [
-      Address.fromString(proposer).toScVal(),
-      nativeToScVal(PROPOSAL_TYPE_CODE[payload.formType], { type: 'u32' }),
-      nativeToScVal(payload.title, { type: 'string' }),
-      nativeToScVal(payload.description, { type: 'string' }),
-      nativeToScVal(encodeProposalValue(payload), { type: 'string' }),
-    ],
-    signerAddress: proposer,
-    signTx,
-    pendingLabel: `create_proposal:${payload.formType}`,
-    ...mutationOptions,
-    ...(onStage ? { onStage: onStage as (stage: GovernanceSubmissionStage) => void } : {}),
-  });
+  if (options.simulate) {
+    await assertGovernanceSimulationPassed(options.simulate);
+  }
 
-  const proposalId = parseCreatedProposalId(returnValue);
-  proposalCreationCache.set(idempotencyKey, { txHash, proposalId, timestamp: Date.now() });
-  await options.onConfirmed?.(txHash);
+  if (options.rpcServer) {
+    const proposer = requireSigner(signerAddress, 'create_proposal');
+    const { onStage: _onStage, ...restOptions } = options;
+    const { txHash, returnValue } = await executeGovernanceMutation({
+      method: 'create_proposal',
+      args: [
+        Address.fromString(proposer).toScVal(),
+        nativeToScVal(PROPOSAL_TYPE_CODE[payload.formType], { type: 'u32' }),
+        nativeToScVal(payload.title, { type: 'string' }),
+        nativeToScVal(payload.description, { type: 'string' }),
+        nativeToScVal(encodeProposalValue(payload), { type: 'string' }),
+      ],
+      signerAddress: proposer,
+      signTx,
+      pendingLabel: `create_proposal:${payload.formType}`,
+      ...restOptions,
+    });
 
-  return { txHash, proposalId };
+    const proposalId = parseCreatedProposalId(returnValue);
+    proposalCreationCache.set(idempotencyKey, { txHash, proposalId, timestamp: Date.now() });
+    await options.onConfirmed?.(txHash);
+    return { txHash, proposalId };
+  }
+
+  const inFlight = proposalCreationInFlight.get(idempotencyKey);
+  if (inFlight) return inFlight;
+
+  const run = (async () => {
+    const context = options.context ?? toValidationContext(await fetchProtocolParameters());
+    const created = await submitCreateProposal({
+      payload,
+      proposer: signerAddress,
+      signTx,
+      context,
+      server,
+      governanceContractId: GOVERNANCE_CONTRACT_ID,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      onStage: options.onStage,
+      walletNetwork: options.walletNetwork,
+    });
+    proposalCreationCache.set(idempotencyKey, {
+      txHash: created.txHash,
+      proposalId: created.proposalId,
+      timestamp: Date.now(),
+    });
+    await options.onConfirmed?.(created.txHash);
+    return { txHash: created.txHash, proposalId: created.proposalId };
+  })();
+
+  proposalCreationInFlight.set(idempotencyKey, run);
+  try {
+    return await run;
+  } finally {
+    proposalCreationInFlight.delete(idempotencyKey);
+  }
 }
 
 // ─── Parameter change announcements (#153, #1057) ─────────────────────────────

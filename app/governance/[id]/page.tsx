@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import Navbar from '@/components/Navbar';
 import VoteSection from '@/components/VoteSection';
 import GovernanceMockStatusBanner from '@/components/governance/GovernanceMockStatusBanner';
@@ -258,7 +258,7 @@ export default function ProposalDetailPage() {
     const result = await execute(
       async (signTx) =>
         castVote(proposal.id, choice, address, signTx, {
-          walletNetwork,
+          walletNetwork: walletNetwork ?? undefined,
           onConfirmed: async () => {
             await invalidateGovernanceQueries({
               proposalId: proposal.id,
@@ -287,7 +287,7 @@ export default function ProposalDetailPage() {
     const result = await execute(
       async (signTx) =>
         executeProposal(proposal.id, address, signTx, {
-          walletNetwork,
+          walletNetwork: walletNetwork ?? undefined,
           onConfirmed: async () => {
             await invalidateGovernanceQueries({
               proposalId: proposal.id,
@@ -329,7 +329,7 @@ export default function ProposalDetailPage() {
       const result = await execute(
         async (signTx) =>
           vetoProposal(proposal.id, vetoReasonHash, address, signTx, {
-            walletNetwork,
+            walletNetwork: walletNetwork ?? undefined,
             onConfirmed: async () => {
               await invalidateGovernanceQueries({
                 proposalId: proposal.id,

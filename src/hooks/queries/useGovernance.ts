@@ -27,7 +27,7 @@ import {
 export function useGovernanceProposals() {
   return useQuery<Proposal[], Error>({
     queryKey: governanceKeys.proposals,
-    queryFn: fetchProposals,
+    queryFn: () => fetchProposals(),
     ...createQueryConfig({
       ...QUERY_TIMINGS.governanceProposals,
     }),
@@ -81,4 +81,3 @@ export function useInvalidateGovernanceQueries() {
     [queryClient]
   );
 }
-

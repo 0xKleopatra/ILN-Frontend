@@ -24,10 +24,20 @@ import {
   clearWalletStorage,
   getStoredWalletProvider,
   setStoredWalletProvider,
-  setStoredWalletAddress,
+  WALLET_ADDRESS_STORAGE_KEY,
+  WALLET_DISCONNECT_STORAGE_KEY,
+  WALLET_SESSION_STORAGE_KEY,
   type WalletProviderType,
 } from '@/utils/walletStorage';
 import { purgeExpiredWalletRecords } from '@/utils/walletRecordStore';
+import {
+  getWalletSessionTabId,
+  hasWalletSessionConflict,
+  isWalletSessionFresh,
+  publishWalletSession,
+  readWalletSession,
+  type WalletSessionState,
+} from '@/utils/wallet-session-sync';
 import {
   connectWalletConnect,
   disconnectWalletConnect,
@@ -82,9 +92,8 @@ export interface WalletContextType {
   walletNetwork: string | null;
   roles: WalletRole[];
   rolesLoading: boolean;
-  authStatus: 'idle' | 'authenticating' | 'authenticated' | 'error' | 'expired';
-  authError: Sep10Error | null;
-  authDiagnostics: Sep10Diagnostics;
+  /** True when another tab changed the wallet session and this tab was cleared. */
+  sessionConflict: boolean;
   connect: () => Promise<void>;
   connectWalletConnect: (customAddress?: string) => Promise<void>;
   disconnect: () => void;
@@ -152,20 +161,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   const [walletNetwork, setWalletNetwork] = useState<string | null>(null);
   const [roles, setRoles] = useState<WalletRole[]>([]);
   const [rolesLoading, setRolesLoading] = useState(false);
-  const [authStatus, setAuthStatus] = useState<
-    'idle' | 'authenticating' | 'authenticated' | 'error' | 'expired'
-  >('idle');
-  const [authError, setAuthError] = useState<Sep10Error | null>(null);
-  const [authDiagnostics, setAuthDiagnostics] = useState<Sep10Diagnostics>({
-    domain: null,
-    network: NETWORK_NAME,
-    expiresAt: null,
-    serverHealth: 'unknown',
-  });
-  const [authSession, setAuthSessionState] = useState<Sep10Session | null>(null);
-  const authSessionRef = useRef<Sep10Session | null>(null);
-  const authSessionVersion = useRef(0);
-  const activeAddress = useRef<string | null>(null);
+  const [sessionConflict, setSessionConflict] = useState(false);
   // Which provider to connect with is chosen in the selection modal (#2).
   const [isSelectingProvider, setIsSelectingProvider] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState<WalletProviderName | null>(null);
@@ -238,19 +234,56 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     return () => clearTimeout(timer);
   }, [authSession, setAuthSession]);
 
+  const warningToastIdRef = React.useRef<string | null>(null);
+  const disconnectRef = React.useRef<() => void>(() => {});
+  const tabIdRef = useRef(getWalletSessionTabId());
+  const sessionGenerationRef = useRef(0);
+  const lastNetworkRef = useRef<string | null>(null);
+
+  const publishSession = useCallback((state: WalletSessionState) => {
+    publishWalletSession(state, tabIdRef.current);
+  }, []);
+
+  /**
+   * Drop this tab's retained session after another tab changes the account,
+   * provider, or network. No disconnect broadcast is emitted here so tabs do
+   * not echo the change back to each other.
+   */
+  const clearLocalSession = useCallback(() => {
+    setAddress(null);
+    setNetworkMismatch(false);
+    setRpcMismatch(false);
+    setMismatchDetails(null);
+    setSwitchingNetwork(false);
+    setWalletNetwork(null);
+    setError(null);
+    setRoles([]);
+    setRolesLoading(false);
+    setIsSelectingProvider(false);
+    setSelectedProvider(null);
+    setOpenWalletConnectByDefault(false);
+    setIsReconnecting(false);
+    setSessionConflict(true);
+    if (warningToastIdRef.current) {
+      removeToast(warningToastIdRef.current);
+      warningToastIdRef.current = null;
+    }
+    clearWalletStorage(window.localStorage, { broadcast: false });
+    sessionGenerationRef.current += 1;
+  }, [removeToast]);
+
   const checkNetwork = useCallback(async () => {
     try {
       const network = extractNetworkName(await getNetwork());
       if (!network) {
-        invalidateAuthForNetworkChange(
-          'The wallet network could not be verified. Authenticate again after reconnecting.'
-        );
+        lastNetworkRef.current = null;
         setWalletNetwork(null);
         setNetworkMismatch(false);
         setRpcMismatch(false);
         setMismatchDetails(null);
         return true;
       }
+      lastNetworkRef.current = network;
       setWalletNetwork(network);
 
       const details = getMismatchDetails(network);
@@ -274,9 +307,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       return !details.walletMismatch;
     } catch (e) {
       console.error('Failed to get network', e);
-      invalidateAuthForNetworkChange(
-        'The wallet network could not be verified. Authenticate again after reconnecting.'
-      );
+      lastNetworkRef.current = null;
       setWalletNetwork(null);
       setNetworkMismatch(false);
       setRpcMismatch(false);
@@ -457,6 +488,42 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   }, []);
 
   useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.storageArea && event.storageArea !== window.localStorage) return;
+
+      if (event.key === WALLET_DISCONNECT_STORAGE_KEY && event.newValue) {
+        sessionGenerationRef.current += 1;
+        clearLocalSession();
+        return;
+      }
+
+      if (event.key === WALLET_ADDRESS_STORAGE_KEY && event.newValue !== address) {
+        sessionGenerationRef.current += 1;
+        clearLocalSession();
+        return;
+      }
+
+      if (event.key !== WALLET_SESSION_STORAGE_KEY) return;
+      const snapshot = readWalletSession();
+      if (!snapshot || snapshot.tabId === tabIdRef.current || !isWalletSessionFresh(snapshot)) {
+        return;
+      }
+      sessionGenerationRef.current += 1;
+      if (
+        hasWalletSessionConflict(
+          { address, provider: selectedProvider, network: walletNetwork },
+          snapshot
+        )
+      ) {
+        clearLocalSession();
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, [address, selectedProvider, walletNetwork, clearLocalSession]);
+
+  useEffect(() => {
     let cancelled = false;
 
     async function detectRoles(walletAddress: string) {
@@ -490,9 +557,6 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     return () => clearInterval(interval);
   }, [checkActiveWallet]);
 
-  const warningToastIdRef = React.useRef<string | null>(null);
-  const disconnectRef = React.useRef<() => void>(() => {});
-
   const disconnect = useCallback(() => {
     // Clear all in-memory wallet state...
     setAddress(null);
@@ -508,6 +572,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     setIsSelectingProvider(false);
     setSelectedProvider(null);
     setIsReconnecting(false);
+    setSessionConflict(false);
     if (warningToastIdRef.current) {
       removeToast(warningToastIdRef.current);
       warningToastIdRef.current = null;
@@ -621,7 +686,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   const connectFreighter = async () => {
     setIsSelectingProvider(false);
     setError(null);
-    setErrorCode(null);
+    setSessionConflict(false);
     const toastId = addToast({ type: 'pending', title: 'Connecting to Freighter...' });
 
     try {
@@ -660,6 +725,11 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
           journeyRecovery.markRecovered('auth');
 
           const isCorrectNetwork = await checkNetwork();
+          publishSession({
+            address,
+            provider: 'freighter',
+            network: lastNetworkRef.current,
+          });
           if (!isCorrectNetwork) {
             const networkMsg = `Please switch Freighter to ${NETWORK_NAME}`;
             setError(networkMsg);
@@ -694,6 +764,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   const connectWalletConnectProvider = async (customAddress?: string) => {
     setIsSelectingProvider(false);
     setError(null);
+    setSessionConflict(false);
     const toastId = addToast({ type: 'pending', title: 'Connecting via WalletConnect...' });
 
     try {
@@ -703,6 +774,11 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
         setStoredWalletAddress(session.address);
         setSelectedProvider('walletconnect');
         setStoredWalletProvider('walletconnect');
+        publishSession({
+          address: session.address,
+          provider: 'walletconnect',
+          network: getConfiguredStellarNetwork(),
+        });
         updateToast(toastId, {
           type: 'success',
           title: 'Connected',
@@ -729,6 +805,11 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       if (extension?.setNetwork) {
         await extension.setNetwork(targetNetwork);
         await checkNetwork();
+        publishSession({
+          address,
+          provider: selectedProvider,
+          network: lastNetworkRef.current ?? targetNetwork,
+        });
         if (!networkMismatch) {
           addToast({
             type: 'success',
@@ -740,6 +821,11 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       }
 
       await requestAccess();
+      publishSession({
+        address,
+        provider: selectedProvider,
+        network: lastNetworkRef.current ?? targetNetwork,
+      });
       addToast({
         type: 'info',
         title: 'Switch Network',
@@ -756,40 +842,64 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     } finally {
       setSwitchingNetwork(false);
     }
-  }, [address, networkMismatch, checkNetwork, addToast]);
+  }, [address, networkMismatch, checkNetwork, addToast, publishSession, selectedProvider]);
 
-  const disconnect = () => {
-    // Clear all in-memory wallet state...
-    authSessionVersion.current += 1;
-    activeAddress.current = null;
-    setAddress(null);
-    setAuthSession(null);
-    setAuthStatus('idle');
-    setAuthError(null);
-    setAuthDiagnostics({
-      domain: null,
-      network: NETWORK_NAME,
-      expiresAt: null,
-      serverHealth: 'unknown',
-    });
-    setNetworkMismatch(false);
-    setRpcMismatch(false);
-    setMismatchDetails(null);
-    setSwitchingNetwork(false);
-    setWalletNetwork(null);
-    setError(null);
-    setRoles([]);
-    setRolesLoading(false);
-    setIsSelectingProvider(false);
-    setSelectedProvider(null);
-    setIsReconnecting(false);
-    // ...and every persisted/cached trace of the session (#4).
-    clearWalletStorage();
-    trackEvent('wallet_disconnected');
-    addToast({ type: 'success', title: 'Disconnected' });
-    // Leave any wallet-gated view for the public home page.
-    router.push('/');
-  };
+  const signTx = async (txXdr: string) => {
+    if (sessionConflict) {
+      const msg = 'Wallet session changed in another tab. Reconnect before signing.';
+      addToast({ type: 'error', title: 'Transaction Failed', message: msg });
+      throw new Error(msg);
+    }
+
+    const generationAtStart = sessionGenerationRef.current;
+    const expectedSession: WalletSessionState = {
+      address,
+      provider: selectedProvider,
+      network: walletNetwork,
+    };
+    const staleMessage = 'Wallet session changed in another tab. Reconnect before signing.';
+
+    const assertNoCrossTabChange = () => {
+      const snapshot = readWalletSession();
+      if (
+        snapshot &&
+        snapshot.tabId !== tabIdRef.current &&
+        isWalletSessionFresh(snapshot) &&
+        hasWalletSessionConflict(expectedSession, snapshot)
+      ) {
+        addToast({ type: 'error', title: 'Transaction Failed', message: staleMessage });
+        throw new Error(staleMessage);
+      }
+    };
+    const assertGenerationUnchanged = () => {
+      if (sessionGenerationRef.current !== generationAtStart) {
+        addToast({ type: 'error', title: 'Transaction Failed', message: staleMessage });
+        throw new Error(staleMessage);
+      }
+    };
+
+    assertNoCrossTabChange();
+    const isCorrectNetwork = await checkNetwork();
+    if (!isCorrectNetwork) {
+      const msg = `Network mismatch. Please switch to ${NETWORK_NAME}`;
+      addToast({ type: 'error', title: 'Transaction Failed', message: msg });
+      throw new Error(msg);
+    }
+    assertGenerationUnchanged();
+
+    if (address) {
+      const currentAddress =
+        selectedProvider === 'walletconnect'
+          ? getWalletConnectAddress()
+          : (await getAddress()).address;
+      if (!currentAddress || currentAddress !== address) {
+        addToast({ type: 'error', title: 'Transaction Failed', message: staleMessage });
+        throw new Error(staleMessage);
+      }
+    }
+
+    assertNoCrossTabChange();
+    assertGenerationUnchanged();
 
   const signTx = useCallback(
     async (txXdr: string) => {
@@ -1026,9 +1136,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
         walletNetwork: walletNetwork ? normalizeWalletNetwork(walletNetwork) : null,
         roles,
         rolesLoading,
-        authStatus,
-        authError,
-        authDiagnostics,
+        sessionConflict,
         connect,
         connectWalletConnect: connectWalletConnectProvider,
         disconnect,

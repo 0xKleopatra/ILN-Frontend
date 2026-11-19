@@ -33,6 +33,7 @@ export default function StatsMetricCards({ stats }: Props) {
         value={stats.total_invoices.toLocaleString()}
         sub="All invoices on-chain"
         accent={false}
+        provenance={stats.provenance}
       />
       <MetricCard
         id="stat-total-funded"
@@ -41,6 +42,7 @@ export default function StatsMetricCards({ stats }: Props) {
         value={stats.total_funded.toLocaleString()}
         sub="Invoices funded by LPs"
         accent={false}
+        provenance={stats.provenance}
       />
       <MetricCard
         id="stat-total-paid"
@@ -49,6 +51,7 @@ export default function StatsMetricCards({ stats }: Props) {
         value={stats.total_paid.toLocaleString()}
         sub="Successfully settled"
         accent={false}
+        provenance={stats.provenance}
       />
       <MetricCard
         id="stat-total-volume"
@@ -57,6 +60,7 @@ export default function StatsMetricCards({ stats }: Props) {
         value={formatFinancialUsd(stats.total_volume_usd)}
         sub={`${provenance.label} · ${freshnessLabel} · USD-equivalent funded`}
         accent={true}
+        provenance={stats.provenance}
       />
       <MetricCard
         id="stat-protocol-fees"
@@ -73,6 +77,7 @@ export default function StatsMetricCards({ stats }: Props) {
             </span>
           ) : null
         }
+        provenance={stats.provenance}
       />
     </div>
   );

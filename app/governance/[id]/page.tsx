@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Navbar from '@/components/Navbar';
 import VoteSection from '@/components/VoteSection';
 import GovernanceMockStatusBanner from '@/components/governance/GovernanceMockStatusBanner';
@@ -186,9 +186,7 @@ function VetoProposalModal({
 export default function ProposalDetailPage() {
   const params = useParams();
   const router = useRouter();
-  const { address, isConnected, connect } = useWallet();
-  const { address, isConnected, connect, signTx, walletNetwork } = useWallet();
-  const { addToast, updateToast } = useToast();
+  const { address, isConnected, connect, walletNetwork } = useWallet();
   const { execute, loading: isVoting } = useTransaction();
   const invalidateGovernanceQueries = useInvalidateGovernanceQueries();
 
@@ -286,13 +284,6 @@ export default function ProposalDetailPage() {
     if (!proposal || !address) return;
 
     setIsExecuting(true);
-    const result = await execute(async (signTx) => executeProposal(proposal.id, address, signTx), {
-      expectedAction: 'execute_proposal',
-      title: 'Executing proposal…',
-      pendingMessage: 'Waiting for wallet signature...',
-      successTitle: 'Proposal executed',
-      successMessage: 'The proposal has been successfully executed.',
-    });
     const result = await execute(
       async (signTx) =>
         executeProposal(proposal.id, address, signTx, {
@@ -305,6 +296,7 @@ export default function ProposalDetailPage() {
           },
         }),
       {
+        expectedAction: 'execute_proposal',
         title: 'Executing proposal…',
         pendingMessage: 'Waiting for wallet signature...',
         successTitle: 'Proposal executed',
@@ -333,65 +325,40 @@ export default function ProposalDetailPage() {
     // handling as voting and execution: simulation errors surface before the
     // wallet prompt, and a confirmation timeout is reported as an unknown
     // outcome rather than a failure (#1044, #1045).
-    const result = await execute(
-      async (signTx) => vetoProposal(proposal.id, vetoReasonHash, address, signTx),
-      {
-        expectedAction: 'veto_proposal',
-        title: 'Vetoing proposal…',
-        pendingMessage: 'Waiting for wallet signature...',
-        successTitle: 'Proposal vetoed',
-        successMessage: 'The proposal has been vetoed on-chain.',
-      }
-    );
-
-    if (result) {
-    const toastId = addToast({ type: 'pending', title: 'Vetoing proposal...' });
     try {
-      const txHash = await vetoProposal(proposal.id, vetoReasonHash, address, signTx, {
-        walletNetwork,
-        onConfirmed: async () => {
-          await invalidateGovernanceQueries({
-            proposalId: proposal.id,
-            voterAddress: address,
-          });
-        },
-      });
-      updateToast(toastId, {
-        type: 'success',
-        title: 'Proposal vetoed',
-        txHash,
-      });
-      setProposal({
-        ...proposal,
-        status: 'Vetoed',
-        vetoHistory: [
-          {
-            proposalId: proposal.id,
-            admin: address,
-            reasonHash: vetoReasonHash,
-            createdAt: Math.floor(Date.now() / 1000),
-          },
-          ...(proposal.vetoHistory ?? []),
-        ],
-      });
-      setVetoModalOpen(false);
-      setVetoReason('');
-      setVetoReasonHash('');
-      // Status comes from the contract on reload rather than being set
-      // locally, so the UI cannot show "Vetoed" for a transaction that never
-      // settled.
-      await load();
-    } catch (err) {
-      updateToast(toastId, {
-        type: 'error',
-        title: 'Veto failed',
-        message: err instanceof Error ? err.message : 'Transaction rejected',
-      });
+      const result = await execute(
+        async (signTx) =>
+          vetoProposal(proposal.id, vetoReasonHash, address, signTx, {
+            walletNetwork,
+            onConfirmed: async () => {
+              await invalidateGovernanceQueries({
+                proposalId: proposal.id,
+                voterAddress: address,
+              });
+            },
+          }),
+        {
+          expectedAction: 'veto_proposal',
+          title: 'Vetoing proposal…',
+          pendingMessage: 'Waiting for wallet signature...',
+          successTitle: 'Proposal vetoed',
+          successMessage: 'The proposal has been vetoed on-chain.',
+        }
+      );
+
+      if (result) {
+        setVetoModalOpen(false);
+        setVetoReason('');
+        setVetoReasonHash('');
+        // Status comes from the contract on reload rather than being set
+        // locally, so the UI cannot show "Vetoed" for a transaction that never
+        // settled.
+        await load();
+      }
     } finally {
       isVetoingRef.current = false;
       setIsVetoing(false);
     }
-    setIsVetoing(false);
   };
 
   // ─── Derived state ──────────────────────────────────────────────────────────
@@ -400,8 +367,7 @@ export default function ProposalDetailPage() {
   const isActive = proposal?.status === 'Active';
   const isPassed = proposal?.status === 'Passed';
   const isAdmin = !!address && address === GOVERNANCE_ADMIN_ADDRESS;
-  const canVote =
-    isActive && !alreadyVoted && isConnected && votingPower > 0 && !votingPowerError;
+  const canVote = isActive && !alreadyVoted && isConnected && votingPower > 0 && !votingPowerError;
 
   const remaining = proposal ? timeRemaining(proposal) : '';
   const now = Math.floor(Date.now() / 1000);
@@ -432,8 +398,13 @@ export default function ProposalDetailPage() {
       <main className="min-h-screen">
         <Navbar />
         <div className="pt-28 pb-20 px-8 max-w-7xl mx-auto">
-          <div className="rounded-2xl border border-error/30 bg-error/10 p-8 text-center" role="alert">
-            <span className="material-symbols-outlined text-4xl text-error block mb-2">cloud_off</span>
+          <div
+            className="rounded-2xl border border-error/30 bg-error/10 p-8 text-center"
+            role="alert"
+          >
+            <span className="material-symbols-outlined text-4xl text-error block mb-2">
+              cloud_off
+            </span>
             <h2 className="text-xl font-bold text-error">Proposal Unavailable</h2>
             <p className="mt-2 text-sm text-on-surface-variant">
               The proposal details could not be retrieved from the governance contract.

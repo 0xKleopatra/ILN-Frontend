@@ -13,8 +13,9 @@ import { CONTRACT_ID, NETWORK_NAME } from '@/constants';
 import { useWallet } from '@/context/WalletContext';
 import { useToast } from '@/context/ToastContext';
 import { formatAddress, formatDate, formatUSDC, tokenAmountToNumber } from '@/utils/format';
+import { getExplorerContractUrl } from '@/utils/explorer';
 import { type Invoice } from '@/utils/soroban';
-import { useInvoices } from '@/hooks/useInvoices';
+import { useInvoices } from '@/hooks/queries';
 import InvoiceStatusBadge from '@/components/InvoiceStatusBadge';
 import LastUpdated from '@/components/LastUpdated';
 import BulkActionBar from '../components/BulkActionBar';
@@ -24,7 +25,7 @@ import ErrorBoundary from '@/components/ErrorBoundary';
 import PageHeader from '@/components/PageHeader';
 import { useVisibleWindow } from '@/hooks/useVisibleWindow';
 
-const STELLAR_EXPERT_CONTRACT_URL = `https://stellar.expert/explorer/${NETWORK_NAME.toLowerCase()}/contract/${CONTRACT_ID}`;
+const STELLAR_EXPERT_CONTRACT_URL = getExplorerContractUrl(CONTRACT_ID, NETWORK_NAME);
 
 /**
  * Skeleton cell widths for the freelancer invoice table, matching its columns:
@@ -455,14 +456,16 @@ export default function DashboardPage() {
                                 >
                                   Public invoice page
                                 </Link>
-                                <a
-                                  className="text-xs font-medium text-primary hover:underline"
-                                  href={STELLAR_EXPERT_CONTRACT_URL}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                >
-                                  Stellar Expert
-                                </a>
+                                {STELLAR_EXPERT_CONTRACT_URL && (
+                                  <a
+                                    className="text-xs font-medium text-primary hover:underline"
+                                    href={STELLAR_EXPERT_CONTRACT_URL}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                  >
+                                    Stellar Expert
+                                  </a>
+                                )}
                               </div>
 
                               {/* Row Action Menu */}
@@ -543,7 +546,9 @@ export default function DashboardPage() {
       <BulkActionBar
         selectedInvoices={selectedInvoices}
         onClearSelection={() => setSelectedIds(new Set())}
-        onRefresh={refetch as any}
+        onRefresh={() => {
+          void refetch();
+        }}
       />
 
       <Footer />

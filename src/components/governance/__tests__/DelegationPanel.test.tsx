@@ -5,12 +5,26 @@ import { DelegationPanel } from '../DelegationPanel';
 
 const mockIsValidStellarAddress = vi.fn();
 const mockGetVotingPower = vi.fn();
+const mockGetDelegationInfo = vi.fn();
+const mockDelegateVotingPower = vi.fn();
 const mockResolveFederatedAddress = vi.fn();
 const mockExecute = vi.fn();
 
 vi.mock('@/utils/governance', () => ({
+  GOVERNANCE_INTEGRATION_STATUS: {
+    castVote: { status: 'Stubbed', label: 'Vote casting' },
+    delegateVotingPower: { status: 'Stubbed', label: 'Vote delegation' },
+    createProposal: { status: 'Stubbed', label: 'Proposal creation' },
+    executeProposal: { status: 'Stubbed', label: 'Proposal execution' },
+    vetoProposal: { status: 'Stubbed', label: 'Proposal veto' },
+    getGovTokenBalance: { status: 'Stubbed', label: 'Token balance lookup' },
+    getQuorumThreshold: { status: 'Stubbed', label: 'Quorum threshold lookup' },
+    getProposalHistory: { status: 'Stubbed', label: 'Proposal history lookup' },
+  },
   isValidStellarAddress: (...args: unknown[]) => mockIsValidStellarAddress(...args),
   getVotingPower: (...args: unknown[]) => mockGetVotingPower(...args),
+  getDelegationInfo: (...args: unknown[]) => mockGetDelegationInfo(...args),
+  delegateVotingPower: (...args: unknown[]) => mockDelegateVotingPower(...args),
 }));
 
 vi.mock('@/utils/federation', () => ({
@@ -21,6 +35,7 @@ vi.mock('@/context/WalletContext', () => ({
   useWallet: () => ({
     address: 'GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC6',
     isConnected: true,
+    signTx: vi.fn(),
   }),
 }));
 
@@ -34,6 +49,15 @@ vi.mock('@/hooks/useTransaction', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockGetDelegationInfo.mockResolvedValue({
+    delegatedTo: null,
+    delegatedAmount: 0,
+    incomingDelegations: 450,
+  });
+  mockGetVotingPower.mockResolvedValue(1700);
+  mockDelegateVotingPower.mockResolvedValue(
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+  );
 });
 
 describe('DelegationPanel', () => {

@@ -5,6 +5,7 @@ import { useApprovedTokens } from '@/hooks/useApprovedTokens';
 import { useBalances } from '@/hooks/useBalances';
 import { useWallet } from '@/context/WalletContext';
 import { TokenAmount } from './TokenSelector';
+import { WalletPrivacyControls } from './WalletPrivacyControls';
 import { formatAddress, formatTokenAmount } from '@/utils/format';
 import { NETWORK_NAME } from '@/constants';
 import TestnetFaucetButton from './TestnetFaucetButton';
@@ -20,13 +21,16 @@ export default function WalletButton() {
     disconnect,
     networkMismatch,
     error,
+    authStatus,
+    authError,
+    authDiagnostics,
+    authenticate,
   } = useWallet();
   const { tokens } = useApprovedTokens();
   const allowedTokens = useMemo(() => tokens.filter((token) => token.isAllowed), [tokens]);
   // Auto-refreshes every 30s and on each successful transaction; tokens that
   // fail to load surface via `unavailable` for the "Add Trustline" prompt.
   const { balances, unavailable, isLoading: isLoadingBalances } = useBalances(tokens);
-  const [copied, setCopied] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -49,6 +53,14 @@ export default function WalletButton() {
     } catch {
       // Clipboard unavailable — nothing actionable to surface.
     }
+  };
+
+  const handleAuthenticate = () => {
+    void authenticate().catch((cause: unknown) => {
+      if (!(cause instanceof Error)) {
+        console.error('SEP-10 authentication failed', cause);
+      }
+    });
   };
 
   if (isConnected) {
@@ -137,29 +149,69 @@ export default function WalletButton() {
               </div>
             )}
 
+            <section
+              aria-label="Authentication readiness"
+              className="flex flex-col gap-2 border-t border-outline-variant/10 p-3"
+            >
+              <p className="px-1 text-[10px] font-bold uppercase tracking-[0.16em] text-on-surface-variant/70">
+                SEP-10 authentication
+              </p>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 px-1 text-xs text-on-surface-variant">
+                <dt>Domain</dt>
+                <dd className="truncate text-right text-on-surface">
+                  {authDiagnostics.domain ?? 'Not discovered'}
+                </dd>
+                <dt>Network</dt>
+                <dd className="text-right text-on-surface">{authDiagnostics.network}</dd>
+                <dt>Session expiry</dt>
+                <dd className="text-right text-on-surface">
+                  {authDiagnostics.expiresAt
+                    ? new Intl.DateTimeFormat(undefined, {
+                        dateStyle: 'short',
+                        timeStyle: 'short',
+                      }).format(authDiagnostics.expiresAt)
+                    : 'No active session'}
+                </dd>
+                <dt>Auth server</dt>
+                <dd className="text-right text-on-surface">
+                  {authDiagnostics.serverHealth === 'available'
+                    ? 'Available'
+                    : authDiagnostics.serverHealth === 'unavailable'
+                      ? 'Unavailable'
+                      : 'Not checked'}
+                </dd>
+              </dl>
+              <button
+                type="button"
+                onClick={handleAuthenticate}
+                disabled={networkMismatch || authStatus === 'authenticating'}
+                className="min-h-10 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-surface-container-lowest transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {authStatus === 'authenticating'
+                  ? 'Authenticating...'
+                  : authStatus === 'authenticated'
+                    ? 'Refresh authentication'
+                    : 'Authenticate wallet'}
+              </button>
+              {authError && (
+                <p className="px-1 text-xs text-error" role="alert">
+                  {authError.message}
+                </p>
+              )}
+              <p className="sr-only" aria-live="polite">
+                Authentication status: {authStatus}
+              </p>
+            </section>
+
             <div className="flex flex-col gap-1 border-t border-outline-variant/10 p-2">
               <TestnetFaucetButton />
-              <button
-                onClick={() => {
-                  void handleCopyAddress();
-                }}
-                className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-surface-container-highest text-sm text-on-surface w-full text-left transition-colors"
-              >
-                <span className="material-symbols-outlined text-[16px]">
-                  {copied ? 'check' : 'content_copy'}
-                </span>
-                {copied ? 'Copied!' : 'Copy Address'}
-              </button>
-              <button
-                onClick={() => {
+              <WalletPrivacyControls
+                address={address!}
+                onDisconnect={() => {
                   disconnect();
                   setDropdownOpen(false);
                 }}
-                className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-error-container hover:text-on-error-container text-error text-sm w-full text-left transition-colors"
-              >
-                <span className="material-symbols-outlined text-[16px]">logout</span>
-                Disconnect
-              </button>
+              />
             </div>
           </div>
         )}

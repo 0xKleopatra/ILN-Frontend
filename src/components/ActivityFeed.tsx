@@ -3,9 +3,18 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import Link from 'next/link';
 import { formatAddress, formatRelativeTime, formatUSDC } from '@/utils/format';
+import { fetchInvoiceEvents } from '@/lib/indexer';
 import IndexerUnavailableNotice, {
   shouldUseDevMockFallback,
+  type IndexerNoticeStatus,
 } from '@/components/IndexerUnavailableNotice';
+import DataSourceCaption from '@/components/DataSourceCaption';
+import {
+  fetchInvoiceEvents,
+  classifyIndexerClientError,
+  isAbortError,
+  type RawInvoiceEvent,
+} from '@/lib/indexer-client';
 
 type InvoiceEventType =
   | 'submitted'
@@ -18,14 +27,6 @@ type InvoiceEventType =
   | 'dispute_resolved'
   | 'unknown';
 
-interface RawInvoiceEvent {
-  type?: string;
-  timestamp?: number | string;
-  actor?: string;
-  data?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
 interface InvoiceEvent {
   type: InvoiceEventType;
   timestamp: number;
@@ -37,8 +38,6 @@ interface InvoiceEvent {
 interface ActivityFeedProps {
   invoiceId: bigint;
 }
-
-const INDEXER_API_BASE = process.env.NEXT_PUBLIC_INDEXER_API_URL ?? 'https://api.iln.example.com';
 
 const EVENT_TYPE_MAP: Record<string, InvoiceEventType> = {
   submitted: 'submitted',
@@ -278,22 +277,28 @@ export default function ActivityFeed({ invoiceId }: ActivityFeedProps) {
   const [events, setEvents] = useState<InvoiceEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<IndexerNoticeStatus>('unavailable');
   const [expandedEvents, setExpandedEvents] = useState<Record<number, boolean>>({});
 
-  const fetchEvents = useCallback(async () => {
+  const fetchEvents = useCallback(async (signal?: AbortSignal) => {
     try {
       setLoading(true);
-      // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- Legacy inline exception pending query hook migration
-      const res = await fetch(`${INDEXER_API_BASE}/invoice/${invoiceId}/events`, {
-        cache: 'no-store',
-      });
-      if (!res.ok) throw new Error('Failed to fetch activity feed');
-      const rawEvents = (await res.json()) as RawInvoiceEvent[];
+      setError(null);
+      const rawEvents = await fetchInvoiceEvents(invoiceId, { signal });
       setEvents(rawEvents.map(parseInvoiceEvent));
     } catch (err) {
+      if (isAbortError(err)) {
+        return;
+      }
       console.error(err);
       setEvents([]);
       setError('Unable to load activity feed.');
+      const boundary = classifyIndexerClientError(err);
+      setErrorStatus(
+        boundary === 'rate-limited' || boundary === 'unauthorized' || boundary === 'malformed'
+          ? boundary
+          : 'unavailable'
+      );
 
       // Only substitute demonstration data in development. In every other
       // environment (including production) show the honest "temporarily
@@ -331,7 +336,11 @@ export default function ActivityFeed({ invoiceId }: ActivityFeedProps) {
   }, [invoiceId]);
 
   useEffect(() => {
-    fetchEvents();
+    const controller = new AbortController();
+    void fetchEvents(controller.signal);
+    return () => {
+      controller.abort();
+    };
   }, [fetchEvents]);
 
   const sortedEvents = useMemo(
@@ -366,6 +375,7 @@ export default function ActivityFeed({ invoiceId }: ActivityFeedProps) {
         </p>
         <IndexerUnavailableNotice
           dataSource="The invoice activity feed"
+          status={errorStatus}
           onRetry={() => {
             setError(null);
             setEvents([]);
@@ -390,6 +400,7 @@ export default function ActivityFeed({ invoiceId }: ActivityFeedProps) {
       <div className="mb-6">
         <p className="text-xs font-bold uppercase tracking-widest text-primary">Event History</p>
         <h2 className="mt-2 text-xl font-semibold text-on-surface">Invoice audit trail</h2>
+        <DataSourceCaption metric="invoice-activity" className="mt-1" />
       </div>
 
       <div className="space-y-4 relative">

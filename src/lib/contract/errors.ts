@@ -34,6 +34,7 @@ export type ContractErrorCode =
   | 'PayerUnverified'
   | 'OracleDataStale'
   | 'OracleCircuitOpen'
+  | 'CapExceeded'
   | 'MaxInvoiceAmountExceeded'
   | 'GlobalVolumeCapExceeded'
   | 'QueueNotMature'
@@ -233,6 +234,13 @@ export const CONTRACT_ERROR_MAP: Record<ContractErrorCode, ContractErrorInfo> = 
     remediation:
       'Wait for the oracle feed to recover and the circuit to reset before retrying funding.',
   },
+  CapExceeded: {
+    title: 'Governance Cap Exceeded',
+    message:
+      'The requested invoice amount exceeds the current governance TVL or invoice-size cap during rollout.',
+    remediation:
+      'Lower the invoice amount to fit within the active launch cap, or wait for governance to increase limits.',
+  },
   MaxInvoiceAmountExceeded: {
     title: 'Max Invoice Amount Exceeded',
     message:
@@ -299,7 +307,14 @@ export const UNKNOWN_CONTRACT_ERROR: ContractErrorInfo = {
   remediation: 'Please try again or contact support if the issue persists.',
 };
 
-const ERROR_CODE_KEYS = Object.keys(CONTRACT_ERROR_MAP) as ContractErrorCode[];
+const ERROR_CODE_KEYS = (Object.keys(CONTRACT_ERROR_MAP) as ContractErrorCode[]).sort(
+  (a, b) => b.length - a.length
+);
+
+const CONTRACT_ERROR_NUMBERS: Record<number, ContractErrorCode> = {
+  44: 'MaxInvoiceAmountExceeded',
+  45: 'GlobalVolumeCapExceeded',
+};
 
 /**
  * Attempts to extract a known ContractErrorCode from a variety of error shapes.
@@ -320,9 +335,9 @@ export function parseContractError(error: unknown): ContractErrorCode | null {
       // In Soroban, errors sometimes come back as JSON payloads
       representations.push(JSON.stringify(error));
 
-      const anyError = error as any;
-      if (typeof anyError.message === 'string') representations.push(anyError.message);
-      if (typeof anyError.error === 'string') representations.push(anyError.error);
+      const record = error as Record<string, unknown>;
+      if (typeof record.message === 'string') representations.push(record.message);
+      if (typeof record.error === 'string') representations.push(record.error);
     } catch {
       // Ignore stringify errors (e.g. circular refs)
     }
@@ -334,6 +349,21 @@ export function parseContractError(error: unknown): ContractErrorCode | null {
       if (rep && rep.includes(code)) {
         return code;
       }
+    }
+  }
+
+  // Check for Soroban numeric codes, e.g. Error(Contract, #44) or natural-language cap mentions
+  for (const rep of representations) {
+    if (!rep) continue;
+    const match = /Error\(Contract,\s*#(\d+)\)/.exec(rep);
+    if (match) {
+      const num = Number(match[1]);
+      if (num in CONTRACT_ERROR_NUMBERS) {
+        return CONTRACT_ERROR_NUMBERS[num];
+      }
+    }
+    if (/\b(?:cap[_\s-]?exceeded)\b/i.test(rep)) {
+      return 'CapExceeded';
     }
   }
 

@@ -17,6 +17,11 @@ jobs:
   smoke:
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    env:
+      # Override when the testnet deployment moves. No workflow in this repo
+      # updates the hard-coded fallback, so it can point at a stale build.
+      PLAYWRIGHT_BASE_URL: "${{ vars.TESTNET_SMOKE_URL || 'https://invoice-liquidity-network.vercel.app' }}"
+      NEXT_PUBLIC_API_MOCKING: disabled
     steps:
       - uses: actions/checkout@v4
 
@@ -35,16 +40,39 @@ jobs:
       - name: Install Playwright browsers
         run: pnpm exec playwright install --with-deps chromium
 
+      # The live deployment can lag behind this repo. Surface it in the run
+      # summary so a stale build is diagnosed in seconds, not by reading traces.
+      # Keep this route list in sync with smokeRoutes in e2e/support/testnet-smoke.ts.
+      - name: Check deployment freshness
+        id: preflight
+        run: |
+          base="${PLAYWRIGHT_BASE_URL%/}"
+          stale=""
+          for route in / /marketplace /governance /stats /leaderboard /analytics; do
+            code=$(curl -LsS -o /dev/null -w '%{http_code}' --max-time 15 "$base$route" 2>/dev/null) || code=000
+            echo "$route -> HTTP $code"
+            if [ "$code" = "404" ]; then
+              stale="$stale $route"
+            fi
+          done
+          echo "stale_routes=$stale" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Testnet deployment freshness"
+            echo ""
+            echo "- Target: \`$base\`"
+            if [ -n "$stale" ]; then
+              echo "- ⚠️ Stale deployment. Routes not present in the deployed build:$stale"
+              echo "- The smoke spec skips only those routes; every deployed route is still checked."
+              echo "- Redeploy the current branch in Vercel to restore full coverage."
+            else
+              echo "- ✅ All smoke routes are deployed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run live testnet smoke tests
-        env:
-          PLAYWRIGHT_BASE_URL: https://invoice-liquidity-network.vercel.app
-          NEXT_PUBLIC_API_MOCKING: disabled
         run: pnpm exec playwright test e2e/testnet-smoke.spec.ts --project=mobile-375
 
       - name: Run live testnet governance vote journey
-        env:
-          PLAYWRIGHT_BASE_URL: https://invoice-liquidity-network.vercel.app
-          NEXT_PUBLIC_API_MOCKING: disabled
         run: pnpm exec playwright test e2e/governance-live.spec.ts --project=mobile-375
 
       - name: Upload Playwright report on failure
@@ -55,22 +83,42 @@ jobs:
           path: playwright-report/
           retention-days: 7
 
-      - name: Create issue on failure
+      # Repeated stale-deployment failures previously opened a new issue every
+      # night. Report on the oldest open tracking issue instead of duplicating it.
+      - name: Report failure on the tracking issue
         if: failure() && github.event_name != 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
             const title = `Nightly testnet E2E smoke failed for ${context.repo.repo}`;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
               'The scheduled Playwright smoke run against the live testnet deployment failed.',
               '',
-              `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `Workflow run: ${runUrl}`,
+              '',
+              `Stale deployment routes from this run: \`${{ steps.preflight.outputs.stale_routes || 'none' }}\``,
             ].join('\n');
 
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body,
-              labels: ['ci', 'automated'],
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`,
+              sort: 'created',
+              order: 'asc',
             });
+
+            if (existing.data.items.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data.items[0].number,
+                body: `Another nightly smoke failure.\n\n${body}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['ci', 'automated'],
+              });
+            }

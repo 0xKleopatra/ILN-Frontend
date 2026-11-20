@@ -12,10 +12,11 @@ test.describe('Live testnet smoke checks', () => {
       const response = await page.goto(route.path, { waitUntil: 'domcontentloaded' });
       const status = response?.status();
 
-      // The live deployment can lag behind this repo. A 404 for a route that is
-      // still in source is a deployment problem, not an app regression: skip it
-      // with an actionable message instead of failing the nightly run and opening
-      // yet another duplicate issue. A route that was really removed still fails.
+      // A 404 for a route that still exists in this repo means the live deployment
+      // predates it. That is a deployment problem, not an application regression:
+      // skip with an actionable message instead of failing the nightly run (and
+      // opening yet another duplicate issue). Routes that really were removed
+      // still fail, so the route list cannot silently go stale.
       if (classifyRouteStatus(status, routeExistsInSource(route.path)) === 'stale-deployment') {
         test.skip(true, staleDeploymentMessage(route.path));
       }

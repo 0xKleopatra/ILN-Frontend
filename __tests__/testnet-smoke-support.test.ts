@@ -28,7 +28,7 @@ describe('classifyRouteStatus', () => {
 });
 
 describe('routeExistsInSource', () => {
-  it('finds every route exercised by the smoke spec in this repo', () => {
+  it('finds the routes exercised by the smoke spec in this repo', () => {
     for (const route of smokeRoutes) {
       expect(routeExistsInSource(route.path), route.path).toBe(true);
     }

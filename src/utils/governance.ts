@@ -1052,7 +1052,7 @@ export async function vetoProposal(
     admin,
     reasonHash,
     createdAt: Math.floor(Date.now() / 1000),
-  });
+  };
   proposalTxHashes.set(cacheKey, txHash);
   await options.onConfirmed?.(txHash);
   return txHash;
@@ -1247,36 +1247,6 @@ export async function getDelegationInfo(address: string): Promise<DelegationInfo
 
   const native = scValToNative(callResult.result.retval);
   return parseDelegationInfoFromNative(native);
-}
-
-async function requireGovernanceSignature(
-  intent: string,
-  signerAddress: string,
-  signTx: (xdr: string) => Promise<string>
-): Promise<string> {
-  if (!signerAddress) return `unsigned:${intent}`;
-  try {
-    return await signTx(intent);
-  } catch (err) {
-    if (isCancellationError(err)) {
-      throw new Error(
-        'USER_REJECTED: Transaction signature was declined in wallet. No changes were applied.'
-      );
-    }
-    throw err;
-  }
-}
-
-function deriveGovernanceTxHash(...seeds: string[]): string {
-  const seed = seeds.join('|');
-  let h1 = 0x811c9dc5;
-  let h2 = 0x27d4eb2f;
-  for (let i = 0; i < seed.length; i++) {
-    const ch = seed.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ ch, 0x5f356495) >>> 0;
-  }
-  return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')).repeat(4);
 }
 
 /**

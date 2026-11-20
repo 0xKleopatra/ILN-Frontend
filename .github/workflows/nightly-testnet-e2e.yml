@@ -18,9 +18,10 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     env:
-      # Override when the testnet deployment moves. No workflow in this repo
-      # updates the hard-coded fallback, so it can point at a stale build.
-      PLAYWRIGHT_BASE_URL: "${{ vars.TESTNET_SMOKE_URL || 'https://invoice-liquidity-network.vercel.app' }}"
+      # Override with the repository variable TESTNET_SMOKE_URL when the testnet
+      # deployment moves. The hard-coded fallback is kept for backwards
+      # compatibility but is not updated by any workflow in this repo.
+      PLAYWRIGHT_BASE_URL: ${{ vars.TESTNET_SMOKE_URL || 'https://invoice-liquidity-network.vercel.app' }}
       NEXT_PUBLIC_API_MOCKING: disabled
     steps:
       - uses: actions/checkout@v4
@@ -40,16 +41,16 @@ jobs:
       - name: Install Playwright browsers
         run: pnpm exec playwright install --with-deps chromium
 
-      # The live deployment can lag behind this repo. Surface it in the run
-      # summary so a stale build is diagnosed in seconds, not by reading traces.
-      # Keep this route list in sync with smokeRoutes in e2e/support/testnet-smoke.ts.
+      # The live Vercel deployment can lag behind this repo. Report that here so
+      # a stale build is visible in the run summary, while the smoke spec skips
+      # only the affected routes and still checks every deployed route.
       - name: Check deployment freshness
         id: preflight
         run: |
-          base="${PLAYWRIGHT_BASE_URL%/}"
           stale=""
+          # Keep this list in sync with smokeRoutes in e2e/support/testnet-smoke.ts.
           for route in / /marketplace /governance /stats /leaderboard /analytics; do
-            code=$(curl -LsS -o /dev/null -w '%{http_code}' --max-time 15 "$base$route" 2>/dev/null) || code=000
+            code=$(curl -LsS -o /dev/null -w '%{http_code}' --max-time 15 "$PLAYWRIGHT_BASE_URL$route" 2>/dev/null) || code=000
             echo "$route -> HTTP $code"
             if [ "$code" = "404" ]; then
               stale="$stale $route"
@@ -59,11 +60,11 @@ jobs:
           {
             echo "## Testnet deployment freshness"
             echo ""
-            echo "- Target: \`$base\`"
+            echo "- Target: \`$PLAYWRIGHT_BASE_URL\`"
             if [ -n "$stale" ]; then
               echo "- ⚠️ Stale deployment. Routes not present in the deployed build:$stale"
-              echo "- The smoke spec skips only those routes; every deployed route is still checked."
-              echo "- Redeploy the current branch in Vercel to restore full coverage."
+              echo "- The smoke run skips those routes. Redeploy the current branch in Vercel to restore coverage."
+              echo "- See \`docs/troubleshooting.md\` for the diagnosis steps."
             else
               echo "- ✅ All smoke routes are deployed."
             fi
@@ -83,8 +84,9 @@ jobs:
           path: playwright-report/
           retention-days: 7
 
-      # Repeated stale-deployment failures previously opened a new issue every
-      # night. Report on the oldest open tracking issue instead of duplicating it.
+      # Always comment on the existing tracking issue rather than opening a new
+      # one every night. Repeated stale-deployment failures previously produced
+      # more than a hundred identical open issues.
       - name: Report failure on the tracking issue
         if: failure() && github.event_name != 'pull_request'
         uses: actions/github-script@v7

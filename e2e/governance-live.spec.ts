@@ -21,7 +21,10 @@ async function waitForHydration(page: Page) {
   );
 }
 
-/** Match links to individual proposals, not "Create Proposal" or "How it works". */
+/**
+ * Links to individual proposals only. Matching on text alone also picks up
+ * "Create Proposal" / "How it works", which navigate to different routes.
+ */
 function proposalDetailLink(page: Page) {
   return page
     .locator(
@@ -48,8 +51,9 @@ test.describe('Live testnet governance vote journey', () => {
       .first();
     await expect(heading).toBeVisible({ timeout: 15000 });
 
-    // Assert on content rather than CSS classes: the live deployment may be an
-    // older build without the semantic proposal-card / proposal-empty classes.
+    // Verify the proposals list or its empty state rendered. Assert on content
+    // rather than CSS classes: the live deployment may be an older build that
+    // predates the semantic `proposal-card` / `proposal-empty` classes.
     const mainText = (await main.textContent()) ?? '';
     expect(mainText.trim().length).toBeGreaterThan(100);
   });
@@ -61,7 +65,7 @@ test.describe('Live testnet governance vote journey', () => {
     // Wait for proposals to load
     await page.waitForTimeout(2000);
 
-    // Find and click a link to an individual proposal
+    // Find and click a proposal link (not "Create Proposal" or "How it works")
     const proposalLink = proposalDetailLink(page);
     const linkPresent = await proposalLink.isVisible({ timeout: 5000 }).catch(() => false);
 
@@ -89,7 +93,7 @@ test.describe('Live testnet governance vote journey', () => {
     await waitForHydration(page);
     await page.waitForTimeout(2000);
 
-    // Navigate to a link for an individual proposal
+    // Navigate to a proposal (not "Create Proposal" or "How it works")
     const proposalLink = proposalDetailLink(page);
     const linkPresent = await proposalLink.isVisible({ timeout: 5000 }).catch(() => false);
 

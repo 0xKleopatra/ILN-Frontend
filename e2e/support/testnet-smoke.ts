@@ -5,8 +5,8 @@ import path from 'node:path';
  * Routes exercised by the nightly live-testnet smoke run.
  *
  * The deployed site can lag behind this repository (see docs/troubleshooting.md).
- * Sharing the route list between the Playwright spec and the workflow preflight
- * keeps their definition of a "stale" deployment in sync.
+ * Keeping the route list and the deployment classification in one place means the
+ * smoke spec and the workflow preflight agree on what "stale" means.
  */
 export interface SmokeRoute {
   name: string;
@@ -38,9 +38,9 @@ export const smokeRoutes: SmokeRoute[] = [
 export type RouteDeploymentStatus = 'ok' | 'stale-deployment' | 'failure';
 
 /**
- * A 404 only means "stale deployment" when the route still exists in this repo.
- * If the route was deliberately removed, a 404 is expected and the spec should
- * fail so the route list is corrected instead of silently rotting.
+ * A 404 is only an infrastructure problem when the route actually exists in the
+ * codebase. If the route was removed deliberately, a 404 is the expected result
+ * and the spec should fail so the stale route list gets fixed.
  */
 export function classifyRouteStatus(
   status: number | undefined,
@@ -51,13 +51,14 @@ export function classifyRouteStatus(
   return 'failure';
 }
 
-/** True when this repository still ships a page for the given route path. */
+/** True when this repo still ships a page for the given route path. */
 export function routeExistsInSource(routePath: string, root: string = process.cwd()): boolean {
   const segments = routePath.split('/').filter(Boolean);
-  return [
+  const candidates = [
     path.join(root, 'app', ...segments, 'page.tsx'),
     path.join(root, 'src', 'app', ...segments, 'page.tsx'),
-  ].some((candidate) => existsSync(candidate));
+  ];
+  return candidates.some((candidate) => existsSync(candidate));
 }
 
 export function staleDeploymentMessage(routePath: string): string {
